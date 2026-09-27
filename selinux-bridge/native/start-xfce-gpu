@@ -93,11 +93,16 @@ force_xpresent_vblank() {
   [ "$_vb" = xpresent ]
 }
 
+# Hardware is the default, so the empty case is listed with the names that ask
+# for it rather than being reached by falling off the end. An unknown value is
+# a typo, and a typo must not be indistinguishable from "yes": when the mistake
+# is 'of' for 'off' the caller wanted the GPU *off*, so anything unrecognised
+# is read as the legacy renderer, and said out loud.
 case "${XFCE_GPU:-}" in
   virgl|legacy|off)
     use_legacy "forced by XFCE_GPU=${XFCE_GPU}"
     ;;
-  *)
+  ''|auto|zink|adreno|turnip|gpu|on)
     if [ ! -r "$ACTIVATE" ]; then
       use_legacy "$ACTIVATE not found"
     else
@@ -120,6 +125,9 @@ case "${XFCE_GPU:-}" in
           ;;
       esac
     fi
+    ;;
+  *)
+    use_legacy "unknown XFCE_GPU='${XFCE_GPU}' (expected: auto|zink|virgl|legacy|off)"
     ;;
 esac
 

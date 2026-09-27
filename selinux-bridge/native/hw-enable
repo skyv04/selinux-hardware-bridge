@@ -159,16 +159,25 @@ $MARK_BEGIN
 # aside rather than redoing the work.
 _adreno_prefix="$ADRENO_PREFIX"
 
+# Hardware is the default, so the empty case is listed with the names that
+# ask for it rather than being reached by falling off the end. An unknown
+# value is a typo, and a typo must not be indistinguishable from "yes": when
+# the mistake is 'of' for 'off' the caller wanted the GPU *off*, so the safe
+# reading of anything unrecognised is the legacy renderer, said out loud.
 case "\${XFCE_GPU:-}" in
-    virgl|legacy|off)
-        # The user asked for the legacy renderer; leave the environment be.
-        ;;
-    *)
+    ''|auto|zink|adreno|turnip|gpu|on)
         if [ "\${GALLIUM_DRIVER:-}" = zink ] && [ -n "\${MESA_ADRENO_PREFIX:-}" ]; then
             : # already active, inherited from the session
         elif [ -r "\$_adreno_prefix/activate.sh" ]; then
             . "\$_adreno_prefix/activate.sh"
         fi
+        ;;
+    virgl|legacy|off)
+        # The user asked for the legacy renderer; leave the environment be.
+        ;;
+    *)
+        echo "[hw-enable] unknown XFCE_GPU='\$XFCE_GPU'; using the legacy renderer." \\
+             "Expected: auto|zink|virgl|legacy|off" >&2
         ;;
 esac
 
