@@ -835,6 +835,41 @@ do_doctor() {
             printf '        scripts then have to strip both loader variables\n'
             printf '        by hand, which is the thing that keeps being missed\n'
         fi
+
+        # Knowing the crossing works is not the same as knowing everything
+        # uses it. The browsers broke in scripts that predate the shims, and
+        # the only reason it took a user report is that nothing looked. This
+        # sweeps the places launchers actually live, so a script written
+        # today with the old one-variable habit is caught here rather than by
+        # someone double-clicking an icon and getting silence.
+        local scanned=0 risky=0 d f
+        for d in "$HOME/.local/bin" "$HOME/bin" "$LOCAL_BIN" \
+                 "$HOME/.config/autostart"; do
+            [ -d "$d" ] || continue
+            for f in "$d"/*; do
+                [ -f "$f" ] || continue
+                [ -r "$f" ] || continue
+                case "$f" in *termux-run) continue ;; esac
+                grep -qE 'com\.termux/files|termux-open' "$f" \
+                    2>/dev/null || continue
+                scanned=$((scanned + 1))
+                if grep -q 'termux-run' "$f" 2>/dev/null; then continue; fi
+                if grep -qE '[-]u[[:space:]]+LD_PRELOAD' "$f" 2>/dev/null; then
+                    continue
+                fi
+                risky=$((risky + 1))
+                printf '        %s\n' "$f"
+            done
+        done
+        if [ "$risky" -gt 0 ]; then
+            bad "$risky of $scanned launcher(s) reach Android without clearing LD_PRELOAD"
+            printf '        listed above. They will die in the linker and\n'
+            printf '        appear to do nothing at all. Use termux-run, or\n'
+            printf '        env -u LD_LIBRARY_PATH -u LD_PRELOAD.\n'
+            fails=$((fails + 1))
+        elif [ "$scanned" -gt 0 ]; then
+            ok "all $scanned launcher(s) that reach Android clear both variables"
+        fi
     fi
 
     say ""

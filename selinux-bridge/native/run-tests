@@ -12,7 +12,8 @@
 # bug worth catching here was in the interaction between a real application
 # and a real camera, not in anything a stub would exercise.
 #
-# Usage: native/run-tests [ffmpeg|twoopen|reacq|dupfd|vlc|udev]...  (default: all)
+# Usage: native/run-tests [ffmpeg|twoopen|reacq|dupfd|vlc|udev|crossing]...
+#        (default: all)
 #
 set -uo pipefail
 
@@ -147,14 +148,67 @@ t_udev() {
                                    || bad "sysfs overlay is shadowing real entries"
 }
 
+# The shims are glibc; Termux's binaries are bionic. Exporting the shims in
+# LD_PRELOAD for every login shell therefore stops any bionic child from
+# linking at all, which is how the desktop's browsers once became unlaunchable
+# without printing anything. This checks the supported way back to Android
+# still works *while the shims are loaded*, which is the only condition under
+# which the bug appears.
+t_crossing() {
+    echo "crossing to Android with the shims loaded"
+    local termux_bin=/data/data/com.termux/files/usr/bin
+    local runner=/usr/local/bin/termux-run
+    if [ ! -x "$termux_bin/am" ]; then
+        echo "  skip (no Termux am on this system)"
+        return
+    fi
+    if [ ! -x "$runner" ]; then
+        bad "no $runner (run: hw-enable install)"
+        return
+    fi
+
+    # Load the shims exactly as a login shell does, so the test runs under
+    # the condition that breaks things rather than a clean environment.
+    local preload="$SHIM:$NL_SHIM:$SYSFS_SHIM"
+
+    local out
+    out="$(LD_PRELOAD="$preload" timeout 60 "$runner" am 2>&1 </dev/null)"
+    if printf '%s' "$out" | grep -q "Activity manager"; then
+        ok "termux-run reaches Android's am through the shims"
+    else
+        bad "termux-run cannot reach Android (desktop launchers would fail)"
+        printf '%s\n' "$out" | head -2 | sed 's/^/        /'
+    fi
+
+    # The control. Without this, a passing test above proves nothing: it
+    # could pass on a machine where LD_PRELOAD never posed a problem. The
+    # bare call must actually fail, or the runner is not being tested.
+    out="$(LD_PRELOAD="$preload" timeout 60 "$termux_bin/am" 2>&1 </dev/null)"
+    if printf '%s' "$out" | grep -q "CANNOT LINK EXECUTABLE"; then
+        ok "control: the same call without termux-run still cannot link"
+    else
+        echo "  skip (bare call did not fail; nothing for termux-run to fix here)"
+    fi
+
+    # Callers must not have to know where Termux lives, and must get a
+    # usable exit code rather than a silent nothing.
+    LD_PRELOAD="$preload" "$runner" >/dev/null 2>&1
+    [ "$?" = 64 ] && ok "termux-run with no arguments explains itself (64)" \
+                  || bad "termux-run with no arguments did not return 64"
+    LD_PRELOAD="$preload" "$runner" no-such-binary-anywhere >/dev/null 2>&1
+    [ "$?" = 127 ] && ok "termux-run reports an unknown command (127)" \
+                   || bad "termux-run did not return 127 for an unknown command"
+}
+
 run() {
     case "$1" in
-        ffmpeg)  t_ffmpeg ;;
-        twoopen) t_twoopen ;;
-        reacq)   t_reacq ;;
-        dupfd)   t_dupfd ;;
-        vlc)     t_vlc ;;
-        udev)    t_udev ;;
+        ffmpeg)   t_ffmpeg ;;
+        twoopen)  t_twoopen ;;
+        reacq)    t_reacq ;;
+        dupfd)    t_dupfd ;;
+        vlc)      t_vlc ;;
+        udev)     t_udev ;;
+        crossing) t_crossing ;;
         *) echo "unknown test: $1" >&2; exit 2 ;;
     esac
 }
@@ -162,7 +216,7 @@ run() {
 if [ "$#" -gt 0 ]; then
     for t in "$@"; do run "$t"; done
 else
-    for t in ffmpeg twoopen reacq dupfd vlc udev; do run "$t"; done
+    for t in ffmpeg twoopen reacq dupfd vlc udev crossing; do run "$t"; done
 fi
 
 echo ""

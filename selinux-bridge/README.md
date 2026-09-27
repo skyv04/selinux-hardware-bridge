@@ -673,10 +673,13 @@ termux-run termux-open /sdcard/file.pdf
 ```
 
 The explanation also lives in the generated `/etc/profile.d` file, next to
-the `LD_PRELOAD` line that causes it, and `hw-enable doctor` exercises the
-crossing on every run -- verified against a deliberately broken `am` to
-confirm the check reports a failure rather than simply agreeing with a
-healthy system.
+the `LD_PRELOAD` line that causes it. Two checks now watch it: `run-tests
+crossing` exercises the crossing with the shims loaded, and `hw-enable
+doctor` additionally **sweeps the directories launchers live in** and fails
+if any script reaches Android without clearing both variables -- which is
+the check that would have caught this before a user did. Both were tested
+against a deliberately broken case to confirm they report a failure rather
+than simply agreeing with a healthy system.
 
 The general lesson is the mirror image of the one above: *an interposing
 library is part of the environment of every process you start, including the
@@ -1270,7 +1273,11 @@ rather than waited for; all of it is now checked in as `tools/selftest` and
 | #33 helper | `termux-run` from a login shell with all four shims loaded | bare `am` fails to link; `termux-run am` and `termux-run /abs/path/am` both print `Activity manager (activity) commands`; exit codes **127** unknown command, **64** no arguments, **0** success |
 | #33 checker | New `doctor` section against the live system | `ok env -u LD_LIBRARY_PATH -u LD_PRELOAD reaches Android's am`, noting that the bare call still cannot link, as expected |
 | #33 checker (negative control) | Same logic pointed at an `am` that fails to link | the check **reported failure** rather than passing -- so it detects the bug, it does not merely agree with the current state |
-| #33 no regression | `run-tests`, `test-start-debian`, `hw-enable doctor` after the change | **8/8**, **49/49**, and `all native hardware paths are working` |
+| #33 no regression | `run-tests`, `test-start-debian`, `hw-enable doctor` after the change | **12/12**, **49/49**, and `all native hardware paths are working` |
+| #33 regression test | New `run-tests crossing` case, run with all three shims in `LD_PRELOAD` | **4/4**, including a built-in control asserting the *bare* call still fails -- without it the test would pass on any machine where `LD_PRELOAD` was never a problem, and so would prove nothing |
+| #33 sweep check | `doctor` now scans `~/.local/bin`, `~/bin`, `/usr/local/bin` and `~/.config/autostart` for launchers that reach Android | `all 3 launcher(s) that reach Android clear both variables` |
+| #33 sweep, negative control | Planted a script using the old one-variable habit | `fail 1 of 4 launcher(s) reach Android without clearing LD_PRELOAD`, the offending path printed, and the run ended `1 check(s) failed` |
+| #33 sweep, positive control | Planted a script that uses `termux-run` | accepted (`all 4 ... clear both variables`), so the check rewards the supported form rather than pattern-matching one spelling |
 
 The server-side halves of #1, #10 and #11 live in the APK, and sideloading
 on this device needs a physical install tap that cannot be scripted (`pm
