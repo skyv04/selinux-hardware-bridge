@@ -112,6 +112,75 @@ fully_running() {
     [ "$n" -gt 0 ] && [ "$alive" = "$n" ]
 }
 
+# Find the sink-input PulseAudio created for a given process, and which sink
+# it actually landed on. Printed as "<index> <sink>", or nothing.
+stream_of_pid() { # stream_of_pid <pid>
+    pactl list sink-inputs 2>/dev/null | awk -v want="$1" '
+        /^Sink Input #/ { idx = substr($3, 2); sink = "" }
+        /^[ \t]*Sink:/  { sink = $2 }
+        /application\.process\.id = / {
+            pid = $3; gsub(/"/, "", pid)
+            if (pid == want && idx != "") { print idx, sink; exit }
+        }'
+}
+
+# --device= is a *request*, not a guarantee. module-stream-restore remembers
+# where a stream by this application name was last routed and silently moves
+# it back, so the microphone ends up on whatever sink pacat used before --
+# in practice the phone's speaker. Both processes stay alive and healthy, the
+# FIFO keeps flowing at exactly the right rate, and the only symptom is that
+# the bridge sink sits SUSPENDED and every recording is silence. So place the
+# stream explicitly and confirm where it landed.
+pin_stream_to_sink() { # pin_stream_to_sink <pid> <sink-name>
+    local pid=$1 want=$2 i info idx sink want_idx
+    want_idx=$(pactl list short sinks 2>/dev/null |
+               awk -v n="$want" '$2 == n { print $1; exit }')
+    [ -n "$want_idx" ] || return 0
+
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        info=$(stream_of_pid "$pid")
+        [ -n "$info" ] && break
+        sleep 0.5
+    done
+    [ -n "$info" ] || { echo "warning: pacat registered no stream;" \
+                             "cannot confirm the microphone's routing" >&2; return 1; }
+
+    idx=${info%% *}; sink=${info##* }
+    [ "$sink" = "$want_idx" ] && return 0
+    local was=$sink
+
+    pactl move-sink-input "$idx" "$want" >/dev/null 2>&1
+    info=$(stream_of_pid "$pid"); sink=${info##* }
+    if [ "$sink" = "$want_idx" ]; then
+        echo "note: stream-restore had routed the microphone to sink $was;" \
+             "moved it to $want" >&2
+        return 0
+    fi
+    echo "warning: the microphone stream is on sink ${sink:-unknown}," \
+         "not $want ($want_idx) -- recordings will be silent." >&2
+    echo "         Clear the stale routing with:" >&2
+    echo "           pactl move-sink-input $idx $want" >&2
+    return 1
+}
+
+# Both processes can be alive, and the FIFO can be flowing at exactly the
+# right rate, while the audio goes somewhere else entirely -- see
+# pin_stream_to_sink below. A liveness check cannot see that, so ask where
+# the stream actually is. Prints the offending sink, or nothing when correct.
+misrouted_sink() {
+    local pacat_pid want_idx info sink
+    pacat_pid=$(sed -n '2p' "$PIDFILE" 2>/dev/null)
+    [ -n "$pacat_pid" ] || return 1
+    want_idx=$(pactl list short sinks 2>/dev/null |
+               awk -v n="$SINK_NAME" '$2 == n { print $1; exit }')
+    [ -n "$want_idx" ] || return 1
+    info=$(stream_of_pid "$pacat_pid")
+    [ -n "$info" ] || return 1
+    sink=${info##* }
+    [ "$sink" = "$want_idx" ] && return 1
+    printf '%s' "$sink"
+}
+
 unload_module() {
     # Unload the remap before the sink it is derived from, or PulseAudio is
     # briefly left with a source whose master has gone.
@@ -152,6 +221,11 @@ stop)
     ;;
 status)
     if fully_running; then
+        bad_sink=$(misrouted_sink) && {
+            echo "misrouted: the microphone stream is on sink $bad_sink," \
+                 "not $SINK_NAME -- recordings will be silent" >&2
+            exit 1
+        }
         echo "running (pids $(tr '\n' ' ' <"$PIDFILE"))"
         pactl list short sources 2>/dev/null | grep -E "$SINK_NAME|$REMAP_NAME" || true
         exit 0
@@ -222,6 +296,7 @@ fi
 
 mkfifo "$FIFO" || { echo "cannot create $FIFO" >&2; unload_module; exit 1; }
 
+
 # pacat first: opening a FIFO for reading blocks until a writer appears, and
 # opening it for writing blocks until a reader does, so whichever starts
 # first simply waits. Starting the reader first means the very first samples
@@ -247,6 +322,9 @@ if ! fully_running; then
     rm -f "$PIDFILE" "$FIFO"
     exit 1
 fi
+
+# Both processes being alive says nothing about where the audio is going.
+pin_stream_to_sink "$PACAT_PID" "$SINK_NAME" || true
 
 # Make it the default, otherwise getUserMedia({audio:true}) picks whatever
 # PulseAudio had as default -- usually a sink monitor, which is silent and
