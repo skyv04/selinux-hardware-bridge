@@ -1,0 +1,264 @@
+#!/bin/bash
+# test-start-debian -- exercise the branches of termux/start-debian that
+# decide what happens to the bridge app, the session launcher and the
+# preflight checks.
+#
+# The script itself cannot be run to test this: it kills the X server and
+# replaces the running desktop. So it is sourced with START_DEBIAN_LIB=1,
+# which defines the helpers and stops before anything is started, and the
+# individual functions are driven against stubbed `am` and stubbed ports.
+set -u
+
+HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+SCRIPT="$HERE/start-debian"
+STUB=$(mktemp -d)
+trap 'rm -rf "$STUB"' EXIT
+
+pass=0; fail=0
+check() { # check <name> <expected-substring> <actual>
+    if printf '%s' "$3" | grep -qF "$2"; then
+        printf '  \033[32mPASS\033[0m  %s\n' "$1"; pass=$((pass+1))
+    else
+        printf '  \033[1;31mFAIL\033[0m  %s\n        wanted: %s\n        got: %s\n' \
+               "$1" "$2" "$(printf '%s' "$3" | head -3)"; fail=$((fail+1))
+    fi
+}
+refute() { # refute <name> <forbidden-substring> <actual>
+    if printf '%s' "$3" | grep -qF "$2"; then
+        printf '  \033[1;31mFAIL\033[0m  %s (should not say: %s)\n' "$1" "$2"; fail=$((fail+1))
+    else
+        printf '  \033[32mPASS\033[0m  %s\n' "$1"; pass=$((pass+1))
+    fi
+}
+
+# --- stub `am` -------------------------------------------------------------
+# Behaves like the real one: exit 0 and "Starting:" when the package is
+# there, exit 2 and "does not exist" when it is not. Both were measured
+# against the real `am` on-device before being written down here.
+make_am() { # make_am <installed|missing>
+    cat > "$STUB/am" <<EOF
+#!/bin/sh
+if [ "$1" = installed ]; then
+    echo "Starting: Intent { cmp=\$3 }"
+    exit 0
+else
+    echo "Starting: Intent { cmp=\$3 }"
+    echo "Error type 3"
+    echo "Error: Activity class {\$3} does not exist."
+    exit 2
+fi
+EOF
+    chmod +x "$STUB/am"
+}
+
+load() { START_DEBIAN_LIB=1 . "$SCRIPT"; }
+
+# ==========================================================================
+echo "bridge: already listening"
+out=$(
+    PATH="$STUB:$PATH"; make_am missing            # am must not even be used
+    load
+    port_open() { return 0; }
+    bridge_up 2>&1; echo "rc=$?"
+)
+check "reports it is already running" "already running and listening" "$out"
+check "returns success"               "rc=0"                          "$out"
+refute "does not try to launch it"    "not installed"                 "$out"
+
+# ==========================================================================
+echo
+echo "bridge: app not installed"
+out=$(
+    PATH="$STUB:$PATH"; make_am missing
+    load
+    port_open() { return 1; }
+    bridge_up 2>&1; echo "rc=$?"
+)
+check "says it is not installed"   "the bridge app is not installed" "$out"
+check "names the repository"       "github.com"                      "$out"
+check "gives the build command"    "./build.sh"                      "$out"
+check "says where the APK lands"   "build/apk_final/selinux-bridge.apk" "$out"
+check "mentions the permissions"   "grant Camera and Microphone"     "$out"
+check "continues anyway"           "continuing without it"           "$out"
+check "returns non-zero"           "rc=1"                            "$out"
+
+# ==========================================================================
+echo
+echo "bridge: installed, starts, and comes up"
+out=$(
+    PATH="$STUB:$PATH"; make_am installed
+    load
+    _n=0
+    port_open() { _n=$((_n+1)); [ $_n -ge 3 ]; }   # up on the third poll
+    BRIDGE_WAIT=5
+    bridge_up 2>&1; echo "rc=$?"
+)
+check "waits, then reports listening" "listening on 127.0.0.1:7878" "$out"
+check "returns success"               "rc=0"                        "$out"
+refute "does not claim it is missing" "not installed"               "$out"
+
+# ==========================================================================
+echo
+echo "bridge: installed, starts, never listens (permissions declined)"
+out=$(
+    PATH="$STUB:$PATH"; make_am installed
+    load
+    port_open() { return 1; }
+    BRIDGE_WAIT=2
+    bridge_up 2>&1; echo "rc=$?"
+)
+check "says nothing is listening"  "nothing is listening on port 7878" "$out"
+check "names the likely cause"     "permissions were declined"         "$out"
+check "continues anyway"           "continuing without it"             "$out"
+check "returns non-zero"           "rc=1"                              "$out"
+refute "does not claim it is missing" "not installed"                  "$out"
+
+# ==========================================================================
+echo
+echo "warnings are collected and repeated"
+out=$(
+    load
+    warn "first problem"; warn "second problem"
+    printf 'count=%s\n' "${#WARNINGS[@]}"
+    for w in "${WARNINGS[@]}"; do echo "SUMMARY: $w"; done
+)
+check "collects both"        "count=2"                  "$out"
+check "repeats the first"    "SUMMARY: first problem"   "$out"
+check "repeats the second"   "SUMMARY: second problem"  "$out"
+
+# ==========================================================================
+echo
+echo "die() is actionable and stops"
+out=$( load; die "it broke" "do this:" "    some-command" 2>&1; echo "NOT-REACHED" )
+check "states the problem"   "it broke"        "$out"
+check "says what to do"      "some-command"    "$out"
+refute "does not continue"   "NOT-REACHED"     "$out"
+
+# ==========================================================================
+echo
+echo "no private information is baked in"
+out=$(cat "$SCRIPT")
+for leak in drshamavu /home/drshamavu; do
+    refute "does not contain '$leak'" "$leak" "$out"
+done
+check "user is detected, not hard-coded" "DEBIAN_USER=\${DEBIAN_USER:-}" "$out"
+check "guest home is derived"            "GUEST_HOME=/home/\$DEBIAN_USER" "$out"
+
+# ==========================================================================
+echo
+echo "the over-broad kill is gone"
+# Only executable lines count -- the script explains in a comment why the
+# bare pattern was removed, and that comment must not fail its own test.
+code=$(grep -v '^[[:space:]]*#' "$SCRIPT")
+refute "no bare 'pkill -f X' in code" "pkill -f X" "$code"
+check  "kills termux-x11 specifically" "'termux-x11'" "$code"
+check  "the comment explains why"      "pkill -f X"   "$(grep '^[[:space:]]*#' "$SCRIPT")"
+
+# ==========================================================================
+# A full run, with every external command stubbed. This is the only way to
+# exercise the whole script: run for real it stops the X server and replaces
+# the running desktop, so it can never be tested on the machine it works on.
+# ==========================================================================
+dryrun() { # dryrun <extra-env...>  -- prints the whole session output
+    local d="$STUB/dry"; rm -rf "$d"; mkdir -p "$d"
+    # Step 3 deletes X11 sockets with a real `rm`. Point both tmp roots at
+    # scratch directories so a dry run can never unlink the live display's
+    # socket -- an earlier version of this harness stubbed `pkill` but not
+    # `rm`, and took the running desktop down with it.
+    local sandbox="$STUB/sandbox"; rm -rf "$sandbox"
+    mkdir -p "$sandbox/termux/.X11-unix" "$sandbox/guest/.X11-unix"
+    : > "$sandbox/termux/.X11-unix/X0"
+    : > "$sandbox/guest/.X11-unix/X0"
+    : > "$sandbox/guest/.X0-lock"
+    for c in termux-wake-lock pulseaudio termux-x11 virgl_test_server_android; do
+        printf '#!/bin/sh\nexit 0\n' > "$d/$c"
+    done
+    printf '#!/bin/sh\nexit 1\n'  > "$d/pkill"    # nothing left to kill
+    printf '#!/bin/sh\nexit 0\n'  > "$d/pgrep"    # the X server "is" running
+    printf '#!/bin/sh\nexit 0\n'  > "$d/sleep"    # do not actually wait
+    cat > "$d/am" <<'AM'
+#!/bin/sh
+echo "Starting: Intent { cmp=$3 }"
+exit 0
+AM
+    # Read-only probes run for real; the session launch is only recorded.
+    cat > "$d/proot-distro" <<'PD'
+#!/bin/sh
+while [ $# -gt 0 ]; do [ "$1" = "--" ] && { shift; break; }; shift; done
+case "$*" in
+    *CONTAINER-OK*) exec "$@" ;;
+    *"[ -x"*)       exec "$@" ;;
+    *pgrep*)        exit 1 ;;
+    *)              echo "SESSION-LAUNCH: $*"; exit "${DRY_SESSION_RC:-0}" ;;
+esac
+PD
+    chmod +x "$d"/*
+    env PATH="$d:$PATH" TMPDIR="$sandbox/termux" GUEST_TMP="$sandbox/guest" \
+        "$@" bash "$SCRIPT" 2>&1
+}
+
+echo
+echo "full dry run: everything healthy"
+out=$(dryrun BRIDGE_PORT=7878)
+check "reaches preflight"          "[0]"                        "$out"
+check "detects a real user"        "session user:"              "$out"
+refute "not the injected android account" "aid_u0_"             "$out"
+check "starts the bridge"          "[8]"                        "$out"
+check "launches the session"       "SESSION-LAUNCH:"            "$out"
+check "reaches the post-mortem"    "[10]"                       "$out"
+check "ends cleanly"               "The session exited normally" "$out"
+
+echo
+echo "full dry run: bridge app absent"
+out=$(
+    d="$STUB/dry2"; rm -rf "$d"; mkdir -p "$d"
+    dryrun BRIDGE_PORT=7999 >/dev/null 2>&1   # warm the stub dir
+    cat > "$STUB/dry/am" <<'AM'
+#!/bin/sh
+echo "Error: Activity class {$3} does not exist."
+exit 2
+AM
+    chmod +x "$STUB/dry/am"
+    env PATH="$STUB/dry:$PATH" TMPDIR="$STUB/sandbox/termux" \
+        GUEST_TMP="$STUB/sandbox/guest" BRIDGE_PORT=7999 bash "$SCRIPT" 2>&1
+)
+check "says the app is missing"     "the bridge app is not installed" "$out"
+check "still launches the session"  "SESSION-LAUNCH:"                 "$out"
+check "still reaches post-mortem"   "[10]"                            "$out"
+check "repeats it in the summary"   "needed attention"                "$out"
+
+echo
+echo "full dry run: XFCE_GPU is passed through to the session"
+out=$(dryrun BRIDGE_PORT=7878 XFCE_GPU=virgl)
+check "passes XFCE_GPU=virgl" "XFCE_GPU=virgl" "$out"
+
+echo
+echo "socket cleanup stays inside the configured tmp roots"
+# Step 3 runs a real `rm`. It must honour TMPDIR/GUEST_TMP, or a dry run
+# unlinks the live display's socket -- which is exactly what an earlier
+# version of this harness did to the running desktop.
+check "no hardcoded guest socket path" \
+      "\$GUEST_TMP/.X11-unix" "$(grep -F '.X11-unix' "$SCRIPT")"
+refute "no literal /tmp/.X11-unix" \
+       "\"/tmp/.X11-unix" "$(grep -F '.X11-unix' "$SCRIPT")"
+
+decoy=$(mktemp -d)
+mkdir -p "$decoy/.X11-unix"; : > "$decoy/.X11-unix/X0"; : > "$decoy/.X0-lock"
+dryrun BRIDGE_PORT=7878 >/dev/null 2>&1
+check "removes the socket under GUEST_TMP" "gone" \
+      "$([ -e "$STUB/sandbox/guest/.X11-unix/X0" ] || echo gone)"
+check "removes the lock under GUEST_TMP" "gone" \
+      "$([ -e "$STUB/sandbox/guest/.X0-lock" ] || echo gone)"
+check "leaves an unrelated socket alone" "intact" \
+      "$([ -e "$decoy/.X11-unix/X0" ] && echo intact)"
+check "leaves an unrelated lock alone" "intact" \
+      "$([ -e "$decoy/.X0-lock" ] && echo intact)"
+rm -rf "$decoy"
+
+echo
+if [ $fail -eq 0 ]; then
+    printf '\033[32m%d passed, 0 failed\033[0m\n' "$pass"
+else
+    printf '\033[1;31m%d passed, %d failed\033[0m\n' "$pass" "$fail"
+fi
+exit $((fail > 0))

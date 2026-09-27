@@ -1,0 +1,446 @@
+#!/data/data/com.termux/files/usr/bin/bash
+#
+# start-debian -- bring up a Debian XFCE desktop in Termux with the phone's
+#                 own hardware attached: Adreno GPU, camera, microphone and
+#                 the Qualcomm video codecs.
+#
+# This runs on the *Termux* side, not inside the container. It starts the X
+# server, the audio server, the companion bridge app and then the desktop
+# session, in that order, because each one depends on the one before it.
+#
+# It is deliberately talkative. Every step says what it is doing, and every
+# failure says whether the run can continue without it and what you would
+# have to do to fix it. Only the things that make a desktop impossible are
+# fatal -- a missing camera bridge or a missing audio server costs you that
+# one capability, not the session, so those warn and carry on.
+#
+#   start-debian              start everything (this is all you need)
+#   start-debian --help       the options and what they do
+#
+# Nothing has to be set beforehand. Every setting below can be overridden
+# from the environment if your setup differs.
+
+set -u
+
+# --------------------------------------------------------------------------
+# Configuration -- override any of these from the environment
+# --------------------------------------------------------------------------
+DISTRO=${DISTRO:-debian}                       # proot-distro name
+DEBIAN_USER=${DEBIAN_USER:-}                   # blank = detect it
+DISPLAY_NUM=${DISPLAY_NUM:-0}
+
+BRIDGE_PKG=${BRIDGE_PKG:-com.selinuxbridge.app}
+BRIDGE_ACTIVITY=${BRIDGE_ACTIVITY:-.MainActivity}
+BRIDGE_PORT=${BRIDGE_PORT:-7878}
+BRIDGE_WAIT=${BRIDGE_WAIT:-8}                  # seconds to wait for the port
+BRIDGE_REPO=${BRIDGE_REPO:-https://github.com/skyv04/selinux-hardware-bridge}
+
+# Where the in-container GPU launcher lives. Shipped in this repo as
+# selinux-bridge/native/start-xfce-gpu.
+SESSION_LAUNCHER=${SESSION_LAUNCHER:-.local/bin/start-xfce-gpu}
+
+XFCE_GPU=${XFCE_GPU:-}                         # auto|zink|virgl|legacy|off
+LOG_NAME=${LOG_NAME:-xfce.log}
+
+TMPDIR=${TMPDIR:-/data/data/com.termux/files/usr/tmp}
+GUEST_TMP=${GUEST_TMP:-/tmp}                   # the container's /tmp, as seen
+                                               # from Termux under --shared-tmp
+LOG_TERMUX="$TMPDIR/$LOG_NAME"                 # --shared-tmp makes this the
+LOG_GUEST="$GUEST_TMP/$LOG_NAME"               # same file as this one
+
+# --------------------------------------------------------------------------
+# Output helpers
+# --------------------------------------------------------------------------
+if [ -t 1 ]; then
+    C_STEP=$'\033[1;36m'; C_OK=$'\033[32m'; C_WARN=$'\033[33m'
+    C_ERR=$'\033[1;31m';  C_DIM=$'\033[2m';  C_OFF=$'\033[0m'
+else
+    C_STEP=; C_OK=; C_WARN=; C_ERR=; C_DIM=; C_OFF=
+fi
+
+WARNINGS=()
+
+step() { printf '\n%s[%s]%s %s\n' "$C_STEP" "$1" "$C_OFF" "$2"; }
+ok()   { printf '    %sok%s    %s\n' "$C_OK" "$C_OFF" "$1"; }
+info() { printf '    %s%s%s\n' "$C_DIM" "$1" "$C_OFF"; }
+
+# A warning is something you lost but can still run without. It is repeated
+# in the summary, because a message printed two minutes before the desktop
+# appears is a message nobody reads.
+warn() {
+    printf '    %swarn%s  %s\n' "$C_WARN" "$C_OFF" "$1"
+    WARNINGS+=("$1")
+}
+
+# A fatal error is one that makes a desktop impossible. It always says what
+# to do about it, because "failed" on its own is not actionable.
+die() {
+    printf '\n%s[fatal]%s %s\n' "$C_ERR" "$C_OFF" "$1"
+    shift
+    for line in "$@"; do printf '        %s\n' "$line"; done
+    printf '\n'
+    exit 1
+}
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+usage() {
+    cat <<USAGE
+start-debian -- Debian XFCE in Termux, on the phone's own hardware.
+
+Usage: start-debian [--help]
+
+Everything is automatic. These environment variables change the defaults:
+
+  XFCE_GPU          auto|zink|adreno|turnip|on  use the GPU (default)
+                    virgl|legacy|off            use the software renderer
+                    Anything else is treated as a typo: it says so and uses
+                    the software renderer.
+  DISTRO            proot-distro name                 (default: $DISTRO)
+  DEBIAN_USER       user to log in as        (default: first normal account)
+  DISPLAY_NUM       X display number                  (default: $DISPLAY_NUM)
+  BRIDGE_PKG        companion app package             (default: $BRIDGE_PKG)
+  BRIDGE_PORT       bridge loopback port              (default: $BRIDGE_PORT)
+  BRIDGE_WAIT       seconds to wait for the bridge    (default: $BRIDGE_WAIT)
+  SESSION_LAUNCHER  session launcher, relative to the guest home
+                                                (default: $SESSION_LAUNCHER)
+
+The companion app provides the camera, microphone and hardware codecs. It is
+optional: without it the desktop still starts, just without those. See
+  $BRIDGE_REPO
+USAGE
+    exit 0
+}
+
+[ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ] && usage
+
+# Bash can open a TCP socket by itself, so this needs no netcat.
+port_open() {
+    timeout 2 bash -c "exec 3<>/dev/tcp/127.0.0.1/$1" 2>/dev/null
+}
+
+# --------------------------------------------------------------------------
+# The companion bridge app
+# --------------------------------------------------------------------------
+# Never fatal. The bridge supplies the camera, the microphone and the
+# hardware codecs; without it the desktop is still a desktop, it just has no
+# camera. So every path through here ends in "continuing".
+#
+# The package cannot be looked up with `pm list packages`: pm needs
+# app_process, and SELinux denies that to an untrusted app, so it fails with
+# "Operation not permitted". `am start` does work, and reports a missing
+# package distinguishably -- a non-zero exit and "does not exist" -- so the
+# launch attempt is itself the detection.
+bridge_not_installed() {
+    warn "the bridge app is not installed -- no camera, microphone or codecs"
+    info ""
+    info "The desktop will still start. To add the hardware, install the"
+    info "companion APK and run this script again:"
+    info ""
+    info "    $BRIDGE_REPO"
+    info ""
+    info "Either download the prebuilt APK from that repository's releases,"
+    info "or build it yourself:"
+    info "    git clone $BRIDGE_REPO"
+    info "    cd selinux-hardware-bridge/selinux-bridge && ./build.sh"
+    info "    # produces build/apk_final/selinux-bridge.apk -- copy it to"
+    info "    # /sdcard/Download/ and tap it to sideload"
+    info ""
+    info "Then open the app once and grant Camera and Microphone, so it can"
+    info "hand them to the container."
+    info ""
+    info "continuing without it..."
+}
+
+bridge_up() {
+    if port_open "$BRIDGE_PORT"; then
+        ok "already running and listening on 127.0.0.1:$BRIDGE_PORT"
+        return 0
+    fi
+
+    local am_out am_rc
+    am_out=$(am start --user 0 -n "$BRIDGE_PKG/$BRIDGE_ACTIVITY" 2>&1)
+    am_rc=$?
+
+    if [ "$am_rc" -ne 0 ] || printf '%s' "$am_out" | grep -q 'does not exist'; then
+        bridge_not_installed
+        return 1
+    fi
+
+    # The app launched. Wait for the socket rather than assuming: being
+    # started and being ready to serve are not the same thing, and the usual
+    # reason it never listens is that its permissions were declined.
+    local i
+    for i in $(seq 1 "$BRIDGE_WAIT"); do
+        if port_open "$BRIDGE_PORT"; then
+            ok "listening on 127.0.0.1:$BRIDGE_PORT"
+            return 0
+        fi
+        sleep 1
+    done
+
+    warn "the app started but nothing is listening on port $BRIDGE_PORT after ${BRIDGE_WAIT}s"
+    info "most often this means its permissions were declined. Open the app,"
+    info "check the status line reads \"Listening on 127.0.0.1:$BRIDGE_PORT\","
+    info "and grant Camera and Microphone if it asks."
+    info "continuing without it..."
+    return 1
+}
+
+# Sourcing this file with START_DEBIAN_LIB=1 defines the helpers above and
+# stops, without starting or stopping anything. That is how the tests reach
+# the individual steps: the destructive parts of this script cannot be run
+# just to check that one branch prints the right thing.
+[ "${START_DEBIAN_LIB:-}" = 1 ] && return 0
+
+# --------------------------------------------------------------------------
+# [0] Preflight
+# --------------------------------------------------------------------------
+# Checked up front rather than discovered half way through: finding out that
+# proot-distro is missing *after* the X server is running leaves you to clean
+# up by hand.
+step 0 "Checking what is installed..."
+
+missing_pkgs=()
+for t in proot-distro:proot-distro termux-x11:termux-x11-nightly am:termux-am; do
+    cmd=${t%%:*}; pkg=${t##*:}
+    have "$cmd" || missing_pkgs+=("$pkg ($cmd)")
+done
+if [ ${#missing_pkgs[@]} -gt 0 ]; then
+    die "required Termux packages are missing: ${missing_pkgs[*]}" \
+        "Install them with:" \
+        "    pkg install ${missing_pkgs[*]%% *}" \
+        "termux-x11 comes from the Termux:X11 app's own repository; see" \
+        "    https://github.com/termux/termux-x11"
+fi
+ok "proot-distro, termux-x11 and am are present"
+
+# Whether the container is usable is best answered by entering it, rather
+# than by parsing `proot-distro list` or guessing at a rootfs path: one that
+# is listed but cannot be entered fails just the same, and this way both
+# produce the same message.
+#
+# The same login also picks the account to run the session as, so this costs
+# one container entry rather than two.
+#
+# That account is the *lowest* ordinary uid that has a real login shell and a
+# real home directory. All three conditions are needed: proot injects an
+# Android account into /etc/passwd (aid_u0_aNNN, uid above 10000, home /,
+# shell /sbin/nologin) and it is listed first, so simply taking the first
+# uid >= 1000 picks that instead of the human's account. Choosing the lowest
+# uid rather than the first line makes it independent of file order too.
+probe=$(proot-distro login "$DISTRO" -- sh -c "
+    echo CONTAINER-OK
+    awk -F: '\$3 >= 1000 && \$3 < 60000 && \$7 !~ /(nologin|false)\$/ && \$6 ~ /^\\/home\\// { if (best == \"\" || \$3 < bestid) { best = \$1; bestid = \$3 } } END { print best }' /etc/passwd
+" 2>/dev/null | tr -d '\r')
+
+if ! printf '%s\n' "$probe" | grep -q '^CONTAINER-OK$'; then
+    die "the '$DISTRO' container is not installed, or cannot be entered." \
+        "Install it with:" \
+        "    proot-distro install $DISTRO" \
+        "Then install this project's native hardware support inside it:" \
+        "    proot-distro login $DISTRO" \
+        "    cd selinux-bridge/native && ./hw-enable install" \
+        "If the container *is* installed, try entering it by hand to see the" \
+        "real error:   proot-distro login $DISTRO"
+fi
+ok "container '$DISTRO' can be entered"
+
+[ -z "$DEBIAN_USER" ] && DEBIAN_USER=$(printf '%s\n' "$probe" | sed -n '2p')
+if [ -z "$DEBIAN_USER" ]; then
+    DEBIAN_USER=root
+    warn "no ordinary user account found in '$DISTRO'; running the session as root"
+    info "set DEBIAN_USER=<name> if that is not what you want"
+else
+    ok "session user: $DEBIAN_USER"
+fi
+
+for t in pulseaudio virgl_test_server_android termux-wake-lock; do
+    have "$t" || warn "$t not found; continuing without it"
+done
+
+# --------------------------------------------------------------------------
+# [1] Wake lock
+# --------------------------------------------------------------------------
+step 1 "Acquiring the Termux wake lock..."
+if have termux-wake-lock && termux-wake-lock 2>/dev/null; then
+    ok "held (Android will not suspend Termux mid-session)"
+else
+    warn "could not acquire a wake lock; Android may suspend the session"
+fi
+
+# --------------------------------------------------------------------------
+# [2] Stop anything left over from a previous run
+# --------------------------------------------------------------------------
+step 2 "Stopping leftovers from any previous run..."
+# Each pattern is specific. An earlier version of this script ended with
+# `pkill -f X`, which matches *any* command line containing a capital X and
+# will happily kill unrelated work.
+for pat in 'termux-x11' 'virgl_test_server' 'startxfce4'; do
+    pkill -f "$pat" 2>/dev/null && info "stopped: $pat"
+done
+sleep 2
+ok "done"
+
+step 3 "Removing stale X11 sockets..."
+rm -rf "$TMPDIR/.X11-unix/X$DISPLAY_NUM" "$GUEST_TMP/.X11-unix/X$DISPLAY_NUM" \
+       "$GUEST_TMP/.X${DISPLAY_NUM}-lock" 2>/dev/null
+ok "cleared"
+
+# --------------------------------------------------------------------------
+# [4] VirGL -- the fallback renderer only
+# --------------------------------------------------------------------------
+# Not fatal. This is the software-ish fallback; the session normally runs on
+# Turnip+Zink and never touches it. Refusing to start the desktop because the
+# *fallback* is unavailable would be exactly backwards.
+step 4 "Starting the VirGL fallback renderer..."
+if have virgl_test_server_android; then
+    rm -f "$TMPDIR/.virgl_test"
+    virgl_test_server_android >/dev/null 2>&1 &
+    VIRGL_PID=$!
+    for _ in 1 2 3 4 5; do
+        [ -S "$TMPDIR/.virgl_test" ] && break
+        sleep 1
+    done
+    if [ -S "$TMPDIR/.virgl_test" ]; then
+        ok "ready (pid $VIRGL_PID), held in reserve"
+    else
+        kill "$VIRGL_PID" 2>/dev/null
+        warn "VirGL did not create $TMPDIR/.virgl_test"
+        info "only matters if the GPU path fails; the session would then"
+        info "fall back to llvmpipe (software) instead of virpipe"
+    fi
+else
+    warn "virgl_test_server_android not installed; no fallback renderer"
+fi
+
+info "GPU: Turnip+Zink is the default for the session and for every shell"
+info "     in the container. No variable and no 'adreno-run' wrapper needed."
+info "     Force the software path with: XFCE_GPU=virgl $0"
+
+# --------------------------------------------------------------------------
+# [5] PulseAudio
+# --------------------------------------------------------------------------
+step 5 "Starting PulseAudio (TCP on loopback)..."
+if have pulseaudio; then
+    if pulseaudio --start \
+         --load="module-native-protocol-tcp auth-ip-acl=127.0.0.1 auth-anonymous=1" \
+         --exit-idle-time=-1 2>/dev/null; then
+        ok "listening on 127.0.0.1"
+    else
+        warn "PulseAudio did not start; the desktop will have no sound"
+        info "try: pulseaudio -k ; then run this script again"
+    fi
+else
+    warn "pulseaudio not installed; the desktop will have no sound"
+fi
+
+# --------------------------------------------------------------------------
+# [6] X server
+# --------------------------------------------------------------------------
+# Fatal. Without a display there is no desktop to start.
+step 6 "Launching the Termux:X11 server on :$DISPLAY_NUM..."
+export XDG_RUNTIME_DIR="$TMPDIR"
+termux-x11 ":$DISPLAY_NUM" >/dev/null 2>&1 &
+sleep 3
+
+if ! pgrep -f termux-x11 >/dev/null; then
+    die "the Termux:X11 server did not start." \
+        "This is required -- without a display there is nothing to start." \
+        "Check that the Termux:X11 *app* is installed (it is a separate APK" \
+        "from the termux-x11 command), then try:" \
+        "    pkill -f termux-x11 ; termux-x11 :$DISPLAY_NUM" \
+        "and read the error it prints."
+fi
+ok "running"
+
+step 7 "Bringing the Termux:X11 window to the foreground..."
+if am start --user 0 -n com.termux.x11/com.termux.x11.MainActivity \
+     >/dev/null 2>&1; then
+    ok "foregrounded"
+else
+    warn "could not foreground the Termux:X11 app; open it by hand"
+fi
+sleep 1
+
+# --------------------------------------------------------------------------
+# [8] The companion bridge app
+# --------------------------------------------------------------------------
+step 8 "Starting the SELinux Hardware Bridge app..."
+bridge_up || true
+
+# --------------------------------------------------------------------------
+# [9] The desktop session
+# --------------------------------------------------------------------------
+step 9 "Entering '$DISTRO' and starting the XFCE session..."
+
+if [ "$DEBIAN_USER" = root ]; then
+    GUEST_HOME=/root
+else
+    GUEST_HOME=/home/$DEBIAN_USER
+fi
+LAUNCHER_PATH="$GUEST_HOME/$SESSION_LAUNCHER"
+
+# If the GPU launcher is not installed, fall back to a plain session rather
+# than failing. A software desktop beats no desktop, and the message says
+# exactly what to install to get the GPU back.
+launcher_ok=$(proot-distro login "$DISTRO" -- sh -c \
+    "[ -x '$LAUNCHER_PATH' ] && echo yes" 2>/dev/null | tr -d '\r')
+
+if [ "$launcher_ok" = yes ]; then
+    SESSION_CMD="$LAUNCHER_PATH"
+    ok "using $SESSION_CMD"
+else
+    SESSION_CMD="startxfce4"
+    warn "$LAUNCHER_PATH not found; starting XFCE without GPU selection"
+    info "install it from this repo to get Turnip+Zink and the black-screen"
+    info "interlock:  selinux-bridge/native/start-xfce-gpu -> $LAUNCHER_PATH"
+fi
+
+info "session output -> $LOG_GUEST (inside the container)"
+[ "$LOG_TERMUX" != "$LOG_GUEST" ] &&
+    info "               -> $LOG_TERMUX (the same file, from Termux)"
+
+proot-distro login "$DISTRO" --shared-tmp -- /bin/bash -c \
+  "export PULSE_SERVER=127.0.0.1 XDG_RUNTIME_DIR=\${TMPDIR:-/tmp} &&
+   su - '$DEBIAN_USER' -c 'env DISPLAY=:$DISPLAY_NUM PULSE_SERVER=127.0.0.1 \
+        XFCE_GPU=$XFCE_GPU $SESSION_CMD' > '$LOG_GUEST' 2>&1"
+SESSION_RC=$?
+
+# --------------------------------------------------------------------------
+# [10] Post-mortem
+# --------------------------------------------------------------------------
+step 10 "The session ended (exit $SESSION_RC). Looking at what happened..."
+
+leftovers=$(proot-distro login "$DISTRO" -- pgrep -a xfce 2>/dev/null)
+if [ -n "$leftovers" ]; then
+    warn "these session processes are still running:"
+    printf '%s\n' "$leftovers" | sed 's/^/        /'
+    info "they will be cleaned up next time this script runs"
+else
+    ok "no session processes left behind"
+fi
+
+# --shared-tmp means the guest's /tmp is this same directory, so the log can
+# be read straight from here -- no second container login needed.
+if [ -r "$LOG_TERMUX" ]; then
+    printf '\n%s--- last 40 lines of %s ---%s\n' "$C_DIM" "$LOG_TERMUX" "$C_OFF"
+    tail -40 "$LOG_TERMUX"
+else
+    warn "no session log at $LOG_TERMUX"
+fi
+
+if [ ${#WARNINGS[@]} -gt 0 ]; then
+    printf '\n%s--- %d thing(s) needed attention ---%s\n' \
+           "$C_WARN" "${#WARNINGS[@]}" "$C_OFF"
+    for w in "${WARNINGS[@]}"; do printf '  %s- %s%s\n' "$C_WARN" "$w" "$C_OFF"; done
+fi
+
+printf '\n'
+if [ "$SESSION_RC" -eq 0 ]; then
+    printf '%sDone.%s The session exited normally.\n' "$C_OK" "$C_OFF"
+else
+    printf '%sThe session exited with status %s.%s See the log above.\n' \
+           "$C_WARN" "$SESSION_RC" "$C_OFF"
+fi
+exit 0
