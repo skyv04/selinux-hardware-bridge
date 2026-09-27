@@ -630,6 +630,59 @@ Two general lessons, both of which cost real time here:
   `--virtual-time-budget` both race `getUserMedia` and report a plausible
   lie.
 
+### The thirteenth: the shims stop *other* things from starting
+
+The bugs above are all inside the shim. This one is the shim merely being
+present, and it took the desktop's browsers out without a word.
+
+Making the shims global (gap #27) exports four **glibc** shared objects in
+`LD_PRELOAD` for every login shell. Termux's binaries are **bionic**. A
+bionic process cannot link a glibc object, so the moment a container script
+hands work back to Android -- which is how a browser, a file or the bridge
+app is actually opened -- the child dies in the linker:
+
+```
+CANNOT LINK EXECUTABLE "/data/data/com.termux/files/usr/bin/sh":
+library ".../libv4l2bridge.so" ... not accessible for the namespace
+```
+
+before it runs a single instruction of its own. Nothing else is wrong: the
+shims are correct, the launcher is correct, the app is installed.
+
+What makes it expensive is that it is **invisible from the outside**.
+Launching Chromium from its desktop file with the bug present, `gio launch`
+returned **0** and 20 seconds later there were **0 Chromium processes**. A
+double-click produced no window, no error and no dialogue. Every script
+written before the shims went global cleared `LD_LIBRARY_PATH` only -- which
+had always been sufficient -- so all three of them broke at once, while
+anything that stayed inside the container (VS Code) kept working and made it
+look like a browser problem.
+
+Both loader variables have to go:
+
+```sh
+env -u LD_LIBRARY_PATH -u LD_PRELOAD /data/data/com.termux/files/usr/bin/am ...
+```
+
+Rather than rely on remembering that, `hw-enable install` now writes
+`/usr/local/bin/termux-run`, which is the one supported way to cross:
+
+```sh
+termux-run am start -a android.intent.action.VIEW -d https://example.com
+termux-run termux-open /sdcard/file.pdf
+```
+
+The explanation also lives in the generated `/etc/profile.d` file, next to
+the `LD_PRELOAD` line that causes it, and `hw-enable doctor` exercises the
+crossing on every run -- verified against a deliberately broken `am` to
+confirm the check reports a failure rather than simply agreeing with a
+healthy system.
+
+The general lesson is the mirror image of the one above: *an interposing
+library is part of the environment of every process you start, including the
+ones it was never meant to touch.* A global `LD_PRELOAD` is a decision about
+every future child process, not just the applications you had in mind.
+
 ## Testing without a device
 
 Most of the bridge can be exercised with no phone attached, no APK installed
@@ -1055,6 +1108,7 @@ live microphone at the same time, with no switches at all.
 | 30 | **Nothing started the companion app, and the launcher could not be shared.** The bridge supplies the camera, the microphone and the codecs, but it is an ordinary Android app: it has to be open. Every session began with the user remembering to tap it, and a container that came up without it simply had no camera, with nothing anywhere saying why. The launcher that would be the natural place to fix that was a personal file with a hard-coded account in it, so it could not be published either. Two smaller faults surfaced while generalising it: `pkill -f X` matched **any** command line containing a capital X, and taking the first `/etc/passwd` entry with `uid >= 1000` picks the Android account proot injects (`aid_u0_aNNN`, uid above 10000, home `/`, shell `/sbin/nologin`), which is listed first — so the detected user would have been a `nologin` account. | Medium | ✅ fixed | `termux/start-debian` starts the app on every run and, when it is not installed, prints the repository, the build command, where the APK lands and what to grant — then **continues**, because a missing camera is not a reason to withhold a desktop. The package cannot be looked up: `pm list packages` needs `app_process`, which SELinux denies to an untrusted app (`Operation not permitted`), so the launch attempt is the detection — `am start` exits non-zero with `does not exist` when the package is absent, which was measured before it was relied on. A started app is not a ready one, so it then waits for the loopback port and, if nothing listens, says that permissions being declined is the usual cause. The account is now the **lowest** ordinary uid with a real login shell and a home under `/home`, which is order-independent and skips the injected entry; the kill patterns are specific; and if the GPU launcher is absent the session falls back to plain `startxfce4` with a message rather than failing. |
 | 31 | **The launcher's own test suite took the live desktop down.** The suite runs the launcher end to end with every external command stubbed, and `pkill` was among the stubs -- but `rm` was not, and step 3 removed `/tmp/.X11-unix/X$DISPLAY_NUM` with a hardcoded path. Because `--shared-tmp` makes the container's `/tmp` and Termux's `$TMPDIR` the same directory, each dry run unlinked the **running** X server's socket. The damage is silent and delayed: the server keeps its listening file descriptor, so every window already open carries on as if nothing happened, and only the *next* program to start fails, with `unable to open display`. The socket cannot be put back -- re-linking the still-open inode through `/proc/<pid>/fd` needs `CAP_DAC_READ_SEARCH` and returns `EPERM` here for all 29 socket descriptors -- so the only repair is restarting the server. | Medium | ✅ fixed | The two tmp roots are now configuration (`TMPDIR`, `GUEST_TMP`) instead of literals, and the harness points both at a scratch directory, so a dry run deletes sockets it created itself. Three assertions hold that shut: the script may not contain a literal `/tmp/.X11-unix`, a dry run must delete the sandbox socket and lock, and a decoy directory outside the sandbox must survive untouched. The general lesson is that stubbing the command that *looks* destructive is not the same as containing the one that *is* -- `pkill` was stubbed precisely because it was obvious, while `rm` was not. |
 | 32 | **The microphone was being played into the phone's speaker.** `pacat --device=bridge_mic` is a *request*, not a guarantee: `module-stream-restore` remembers where a stream by that application name was last routed and silently puts it back, so the microphone feed landed on the speaker sink instead of the bridge's null sink. Nothing looked wrong. Both processes were alive, the FIFO carried exactly 96,040 B/s (48 kHz x 1 ch x s16le, the correct rate), and `bridge-mic status` reported `running` -- because it only checked that the PIDs existed. Meanwhile the bridge sink sat `SUSPENDED`, `phone_mic` produced silence, and the supervisor that exists precisely to catch this polled the blind health check every 15 s and saw nothing. Every recording was silent, and the live microphone was audible on the phone's own speaker. | High | ✅ fixed | `bridge-mic` now places the stream explicitly and confirms it: `stream_of_pid()` finds the sink-input by `application.process.id` (unambiguous even with several `pacat` streams), and `pin_stream_to_sink()` moves it and re-reads the routing to check the move took. `status` gained `misrouted_sink()`, so a stream on the wrong sink is now a failure rather than a pass, which is what lets the existing supervisor repair it. The general lesson is that a liveness check is not a health check -- every process here was alive and doing its job correctly; only the destination was wrong. |
+| 33 | **Making the shims global broke every script that hands work back to Android.** Gap #27 put the four libc shims into `LD_PRELOAD` for every login shell. They are *glibc* libraries. Termux's own binaries are *bionic*, and bionic cannot link them, so any container script that execs one -- which is how a browser, a file manager or the bridge app is actually launched -- died with `CANNOT LINK EXECUTABLE ... not accessible for the namespace` before it ran a single instruction. Scripts written before the shims existed only had to clear `LD_LIBRARY_PATH`, and that is exactly what all three of them did. The symptom gave nothing away: double-clicking Google Chrome or Chromium on the desktop did *nothing at all*. No error, no window, no dialog; the wrapper exited 0. VS Code still worked, which made it look like a browser problem, when in fact `start-code-gpu` simply never shells out to a Termux binary. This was a regression I introduced, and it sat there undetected because nothing tested the boundary between the two C libraries. | High | ✅ fixed | Both loader variables must be cleared, not one: `env -u LD_LIBRARY_PATH -u LD_PRELOAD <termux binary>`. Applied to all three affected launchers (`launch-termux-browser`, `open-usb-drive`, `play-on-android`). More usefully, the hazard is now documented where it is created -- the generated `/etc/profile.d/20-selinux-bridge-hw.sh` explains in its own header why a bionic binary cannot inherit these shims and shows the correct invocation -- and `hw-enable doctor` tests the crossing directly, so the next occurrence is caught by the checker rather than by a user double-clicking an icon and getting silence. |
 
 
 ## Verification of the fixes
@@ -1205,6 +1259,18 @@ rather than waited for; all of it is now checked in as `tools/selftest` and
 | #32 detection | `bridge-mic status` with the routing broken, then restored | `misrouted: ... on sink 1, not bridge_mic` **rc=1**; after the move, **rc=0** |
 | #32 end to end | Routing broken by hand, then left alone for 45 s | supervisor logged `microphone bridge back up`, the new stream came up on the bridge sink, and `parec` captured **19.98 s, 99.3% non-zero, RMS 139, peak 2014** -- live room audio, not silence |
 | #32 doctor | `hw-enable doctor` before and after | before: `recorded only 672 bytes -- the source exists but is not flowing`; after: `recorded 526996 bytes of live audio in 3 s`, **all native hardware paths are working** |
+| #33 symptom | Double-clicked Google Chrome and Chromium on the XFCE desktop | nothing happened at all -- no window, no error, no dialog |
+| #33 cause | Ran the shared wrapper `launch-termux-browser` by hand | `CANNOT LINK EXECUTABLE "/data/data/com.termux/files/usr/bin/sh": library "/usr/local/lib/selinux-bridge/libv4l2bridge.so" ... not accessible for the namespace` -- the wrapper's last line cleared `LD_LIBRARY_PATH` but not `LD_PRELOAD` |
+| #33 control | Same `am` call with both variables cleared | printed `Activity manager (activity) commands:` -- confirming the shims, not the wrapper, were the obstacle |
+| #33 scope | Searched every launcher for the one-sided guard | **three** hits, all cleared only `LD_LIBRARY_PATH`: `launch-termux-browser`, `open-usb-drive`, `play-on-android` |
+| #33 fix | Launched both browsers after the change | Chromium came up with **15 processes** and its Vulkan flags intact; Chrome Widevine started (pid 8526) |
+| #33 A/B, broken | Wrapper reverted to the one-variable form, Chromium killed, then launched from its **desktop file** (`gio launch chromium.desktop`) | `gio` **exited 0**, the log showed `CANNOT LINK EXECUTABLE`, and there were **0 Chromium processes after 20 s** -- reproducing the user-visible symptom exactly: a successful-looking double-click and no window |
+| #33 A/B, fixed | One line restored, same kill-and-launch | `Starting service: Intent { act=com.termux.RUN_COMMAND ... }` and **10 Chromium processes within 5 s** from cold |
+| #33 sweep | Searched `~/.local/bin`, `~/bin`, `/usr/local/bin`, both `applications` directories, `~/Desktop` and `~/.config/autostart` for crossings | every executable that reaches Android now either uses `termux-run` or strips both variables explicitly; the only remaining hit is a `.txt` note |
+| #33 helper | `termux-run` from a login shell with all four shims loaded | bare `am` fails to link; `termux-run am` and `termux-run /abs/path/am` both print `Activity manager (activity) commands`; exit codes **127** unknown command, **64** no arguments, **0** success |
+| #33 checker | New `doctor` section against the live system | `ok env -u LD_LIBRARY_PATH -u LD_PRELOAD reaches Android's am`, noting that the bare call still cannot link, as expected |
+| #33 checker (negative control) | Same logic pointed at an `am` that fails to link | the check **reported failure** rather than passing -- so it detects the bug, it does not merely agree with the current state |
+| #33 no regression | `run-tests`, `test-start-debian`, `hw-enable doctor` after the change | **8/8**, **49/49**, and `all native hardware paths are working` |
 
 The server-side halves of #1, #10 and #11 live in the APK, and sideloading
 on this device needs a physical install tap that cannot be scripted (`pm
