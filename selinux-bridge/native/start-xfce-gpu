@@ -1,0 +1,126 @@
+#!/bin/bash
+# Start XFCE, optionally on the Adreno 840 (Turnip + Zink).
+#
+# ---------------------------------------------------------------------------
+# READ THIS BEFORE CHANGING THE DEFAULT.
+#
+# Putting Zink in the *session-wide* environment black-screens this machine.
+# The cause is not Zink itself -- it is xfwm4's GL renderer blacklist:
+#
+#     Software Rasterizer / llvmpipe / SVGA3D / virgl
+#
+# "virgl" is on that list, so for years xfwm4 here logged
+#   "Unsupported GL renderer (virgl (Adreno (TM) 840))"
+# and quietly fell back to XRender/XPresent compositing, which works.
+#
+# "zink Vulkan 1.4(Adreno (TM) 840 (MESA_TURNIP))" is NOT on that list, so
+# xfwm4 happily enables its *GLX* compositor (glXBindTexImageEXT +
+# glXSwapBuffers on the composite overlay).  termux-x11 cannot present that,
+# so the compositor keeps compositing correctly into an overlay that never
+# reaches the display: a completely black screen, with no error anywhere.
+#
+# The counter-measure is vblank_mode=xpresent, which forces xfwm4 back onto
+# the XPresent path and away from GLX.  It is applied automatically below
+# whenever Zink is selected.
+#
+# Apps do NOT need the session to be on Zink.  Blender/Krita/Shotcut get the
+# GPU from their own wrappers, and anything else can use `adreno-run`.  But a
+# full Zink session start has been verified working on this device, so it is
+# now the default: it means every app gets the GPU without special launchers.
+# ---------------------------------------------------------------------------
+#
+#   (default)        Turnip+Zink, guarded by the xpresent interlock above
+#   XFCE_GPU=virgl   force the legacy path (also accepts 'legacy' or 'off')
+#
+ACTIVATE=/opt/mesa-adreno/activate.sh
+LOG=/tmp/xfce-gpu.log
+export LIBGL_ALWAYS_SOFTWARE=0
+
+log() { echo "[gpu] $*" | tee -a "$LOG"; }
+
+use_legacy() {
+  # A login shell may already have activated the Adreno stack (see
+  # /etc/profile.d/25-adreno-gpu.sh), and setting GALLIUM_DRIVER alone would
+  # not undo it: MESA_LOADER_DRIVER_OVERRIDE=zink outranks GALLIUM_DRIVER, so
+  # the session would still come up on Zink -- without the xfwm4 interlock,
+  # which is precisely the black screen this function exists to avoid.
+  unset MESA_LOADER_DRIVER_OVERRIDE VK_DRIVER_FILES VK_ICD_FILENAMES \
+        LIBGL_DRIVERS_PATH MESA_VK_WSI_DEBUG MESA_ADRENO_PREFIX
+  if [ -n "${LD_LIBRARY_PATH:-}" ]; then
+    LD_LIBRARY_PATH=$(printf '%s' "$LD_LIBRARY_PATH" | tr ':' '\n' \
+                      | grep -vx "/opt/mesa-adreno/lib" | paste -sd: -)
+    export LD_LIBRARY_PATH
+  fi
+  export GALLIUM_DRIVER=virpipe
+  log "session on legacy path (virpipe): $1"
+}
+
+# xfwm4 only consults this at startup, so it must be set before startxfce4.
+#
+# This is a hard safety interlock, not a nicety: with vblank_mode=auto, xfwm4
+# under Zink loads the GL stack (libvulkan_freedreno/libGL get mapped into the
+# process), picks GLX compositing and blanks the display.  With xpresent it
+# maps no GL libraries at all.  Both states were verified on this device.
+# If the setting cannot be proven, Zink must not be used.
+#
+# xfconf-query speaks D-Bus, and at this point there is no session bus yet:
+# neither startxfce4 nor /etc/xdg/xfce4/xinitrc starts one, xfce4-session does
+# and that is still ahead of us.  Left alone xfconf-query autolaunches a
+# private bus that then outlives the session, so the bus is handled here
+# explicitly, and every call is bounded -- a launcher that hangs gives no
+# desktop at all, which is worse than the black screen it is guarding against.
+force_xpresent_vblank() {
+  _vb=""
+  if command -v xfconf-query >/dev/null 2>&1; then
+    if [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+      timeout 10 xfconf-query -c xfwm4 -p /general/vblank_mode \
+                              -n -t string -s xpresent >/dev/null 2>&1
+      _vb=$(timeout 10 xfconf-query -c xfwm4 -p /general/vblank_mode 2>/dev/null)
+    elif command -v dbus-run-session >/dev/null 2>&1; then
+      _vb=$(timeout 20 dbus-run-session -- sh -c \
+        'xfconf-query -c xfwm4 -p /general/vblank_mode -n -t string \
+                      -s xpresent >/dev/null 2>&1
+         xfconf-query -c xfwm4 -p /general/vblank_mode 2>/dev/null')
+    fi
+  fi
+  # xfconf is an interface onto a file, and that file is what xfwm4 actually
+  # reads at startup, so it answers the question without needing D-Bus at all.
+  if [ "$_vb" != xpresent ]; then
+    _x="$HOME/.config/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml"
+    [ -r "$_x" ] && grep -q 'name="vblank_mode"[^>]*value="xpresent"' "$_x" \
+      && _vb=xpresent
+  fi
+  [ "$_vb" = xpresent ]
+}
+
+case "${XFCE_GPU:-}" in
+  virgl|legacy|off)
+    use_legacy "forced by XFCE_GPU=${XFCE_GPU}"
+    ;;
+  *)
+    if [ ! -r "$ACTIVATE" ]; then
+      use_legacy "$ACTIVATE not found"
+    else
+      # Probe in a subshell so a broken activate.sh cannot poison this session.
+      RENDERER=$( . "$ACTIVATE" >/dev/null 2>&1
+                  timeout 60 glxinfo -B 2>/dev/null \
+                    | sed -n 's/^OpenGL renderer string: //p' )
+      case "$RENDERER" in
+        *Adreno*|*zink*)
+          if force_xpresent_vblank; then
+            . "$ACTIVATE"
+            log "vblank_mode=xpresent confirmed (keeps xfwm4 off GLX)"
+            log "session on Turnip+Zink: $RENDERER"
+          else
+            use_legacy "could not confirm xfwm4 vblank_mode=xpresent; Zink would black-screen"
+          fi
+          ;;
+        *)
+          use_legacy "probe returned '${RENDERER:-nothing}'"
+          ;;
+      esac
+    fi
+    ;;
+esac
+
+exec startxfce4
