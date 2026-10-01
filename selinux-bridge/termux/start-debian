@@ -47,6 +47,7 @@ GUEST_TMP=${GUEST_TMP:-/tmp}                   # the container's /tmp, as seen
                                                # from Termux under --shared-tmp
 LOG_TERMUX="$TMPDIR/$LOG_NAME"                 # --shared-tmp makes this the
 LOG_GUEST="$GUEST_TMP/$LOG_NAME"               # same file as this one
+PULSE_LOG=${PULSE_LOG:-$TMPDIR/pulseaudio.log} # the audio server's own log
 
 # --------------------------------------------------------------------------
 # Output helpers
@@ -187,6 +188,104 @@ bridge_up() {
     return 1
 }
 
+# --------------------------------------------------------------------------
+# PulseAudio
+# --------------------------------------------------------------------------
+# Never fatal: without it the desktop is silent, not broken. It runs here on
+# the Termux side, where Android's audio is, and the container reaches it
+# over TCP (PULSE_SERVER=127.0.0.1, so the module's default port).
+PULSE_PORT=4713
+
+# Where PulseAudio keeps its pid file, by the rules it uses itself
+# (pa_get_runtime_dir): $PULSE_RUNTIME_PATH, else $XDG_RUNTIME_DIR/pulse,
+# else a <machine-id>-runtime link in its config directory.
+pulse_pid_files() {
+    if [ -n "${PULSE_RUNTIME_PATH:-}" ]; then
+        printf '%s\n' "$PULSE_RUNTIME_PATH/pid"
+    elif [ -n "${XDG_RUNTIME_DIR:-}" ]; then
+        printf '%s\n' "$XDG_RUNTIME_DIR/pulse/pid"
+    else
+        local f
+        for f in "${XDG_CONFIG_HOME:-$HOME/.config}"/pulse/*-runtime/pid; do
+            [ -e "$f" ] && printf '%s\n' "$f"
+        done
+    fi
+}
+
+# A pid file is stale unless the process it names is a pulseaudio. This has
+# to be decided here, because PulseAudio gets it wrong on Android: when a
+# daemon dies without cleaning up (Termux killed, phone rebooted) Android
+# soon hands its pid to another app, whose /proc entry PulseAudio may not
+# read -- so it assumes its daemon is "already running" and refuses to start,
+# while `pulseaudio --check` says nothing is running. Our own daemon runs as
+# our uid, so its /proc entry is always readable: one that is not, is not it.
+pulse_pid_stale() { # pulse_pid_stale <pidfile>
+    local pid
+    pid=$(tr -dc '0-9' < "$1" 2>/dev/null)
+    [ -n "$pid" ] || return 0
+    [ "$(cat "/proc/$pid/comm" 2>/dev/null)" != pulseaudio ]
+}
+
+pulse_up() {
+    if ! have pulseaudio; then
+        warn "pulseaudio not installed; the desktop will have no sound"
+        info "install it with:  pkg install pulseaudio"
+        return 1
+    fi
+
+    # Already serving the container: leave it be, so nothing playing is cut.
+    if port_open "$PULSE_PORT"; then
+        ok "already running and listening on 127.0.0.1:$PULSE_PORT"
+        return 0
+    fi
+
+    if pulseaudio --check 2>/dev/null; then
+        warn "PulseAudio is running but not on 127.0.0.1:$PULSE_PORT; the desktop will have no sound"
+        info "something else started it, without the TCP module. Restart it:"
+        info "    pulseaudio -k ; then run this script again"
+        return 1
+    fi
+
+    local f pid
+    while IFS= read -r f; do
+        { [ -e "$f" ] && pulse_pid_stale "$f"; } || continue
+        pid=$(tr -dc '0-9' < "$f" 2>/dev/null)
+        rm -f "$f" &&
+            info "removed a stale pid file (pid ${pid:-?} is not PulseAudio any more)"
+    done < <(pulse_pid_files)
+
+    # --start on its own reports any failure only as "Daemon startup failed":
+    # the reason is logged by the daemon, after it has detached, so it is sent
+    # to a file. PULSE_SERVER is cleared because, when set, --start declines
+    # to start a server ("User-configured server") and still exits 0.
+    local started=0 i
+    if env -u PULSE_SERVER pulseaudio --start \
+         --load="module-native-protocol-tcp auth-ip-acl=127.0.0.1 auth-anonymous=1" \
+         --exit-idle-time=-1 --log-target="file:$PULSE_LOG" >/dev/null 2>&1; then
+        started=1
+        for i in 1 2 3 4 5; do
+            if port_open "$PULSE_PORT"; then
+                ok "listening on 127.0.0.1:$PULSE_PORT"
+                return 0
+            fi
+            sleep 1
+        done
+    fi
+
+    if [ "$started" = 1 ]; then
+        warn "PulseAudio started but is not listening on 127.0.0.1:$PULSE_PORT; the desktop will have no sound"
+    else
+        warn "PulseAudio did not start; the desktop will have no sound"
+    fi
+    if [ -s "$PULSE_LOG" ]; then
+        info "the end of its log, $PULSE_LOG:"
+        tail -5 "$PULSE_LOG" | while IFS= read -r f; do info "    $f"; done
+    fi
+    info "to watch it fail, run it in the foreground:"
+    info "    pulseaudio -vv --daemonize=no --exit-idle-time=-1"
+    return 1
+}
+
 # Sourcing this file with START_DEBIAN_LIB=1 defines the helpers above and
 # stops, without starting or stopping anything. That is how the tests reach
 # the individual steps: the destructive parts of this script cannot be run
@@ -322,18 +421,7 @@ info "     Force the software path with: XFCE_GPU=virgl $0"
 # [5] PulseAudio
 # --------------------------------------------------------------------------
 step 5 "Starting PulseAudio (TCP on loopback)..."
-if have pulseaudio; then
-    if pulseaudio --start \
-         --load="module-native-protocol-tcp auth-ip-acl=127.0.0.1 auth-anonymous=1" \
-         --exit-idle-time=-1 2>/dev/null; then
-        ok "listening on 127.0.0.1"
-    else
-        warn "PulseAudio did not start; the desktop will have no sound"
-        info "try: pulseaudio -k ; then run this script again"
-    fi
-else
-    warn "pulseaudio not installed; the desktop will have no sound"
-fi
+pulse_up || true
 
 # --------------------------------------------------------------------------
 # [6] X server

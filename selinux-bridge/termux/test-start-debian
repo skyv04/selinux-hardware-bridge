@@ -155,6 +155,162 @@ check  "kills termux-x11 specifically" "'termux-x11'" "$code"
 check  "the comment explains why"      "pkill -f X"   "$(grep '^[[:space:]]*#' "$SCRIPT")"
 
 # ==========================================================================
+# PulseAudio. The stub behaves as the real one was seen to on-device:
+# --check fails when nothing is running, and --start refuses while a pid file
+# exists -- which is what the real one does when that pid has been recycled
+# by another app, whose /proc entry it may not read. HOME is a scratch
+# directory, so the real pid file is never touched.
+# ==========================================================================
+make_pulse() { # make_pulse <starts|fails|running>
+    cat > "$STUB/pulseaudio" <<EOF
+#!/bin/sh
+case "\$1" in
+    --check) [ "$1" = running ] ;;
+    --start)
+        echo "PULSE_SERVER=\${PULSE_SERVER:-unset} \$*" >> "$STUB/pulse.calls"
+        log=
+        for a in "\$@"; do
+            case "\$a" in --log-target=file:*) log=\${a#--log-target=file:} ;; esac
+        done
+        for p in "\$HOME"/.config/pulse/*-runtime/pid; do
+            if [ -e "\$p" ] || [ "$1" = fails ]; then
+                [ -n "\$log" ] && echo "E: [pulseaudio] main.c: pa_pid_file_create() failed." > "\$log"
+                exit 1
+            fi
+        done
+        : > "$STUB/pulse.up" ;;
+esac
+EOF
+    chmod +x "$STUB/pulseaudio"
+    rm -f "$STUB/pulse.calls" "$STUB/pulse.up" "$STUB/pulse.log"
+}
+pulse_home() { # a scratch HOME, with nothing pointing PulseAudio elsewhere
+    export HOME="$STUB/home"
+    unset XDG_RUNTIME_DIR PULSE_RUNTIME_PATH XDG_CONFIG_HOME
+    rm -rf "$HOME"; mkdir -p "$HOME"
+}
+
+echo
+echo "pulse: a recycled pid in a stale pid file no longer blocks the start"
+out=$(
+    PATH="$STUB:$PATH"; make_pulse starts; pulse_home
+    rt="$HOME/.config/pulse/0123abcd-runtime"; mkdir -p "$rt"
+    echo 1 > "$rt/pid"                     # pid 1 is never our pulseaudio
+    export PULSE_SERVER=127.0.0.1
+    PULSE_LOG="$STUB/pulse.log"; load
+    port_open() { [ -e "$STUB/pulse.up" ]; }
+    pulse_up 2>&1; echo "rc=$?"
+    [ -e "$rt/pid" ] && echo "PIDFILE-KEPT" || echo "PIDFILE-GONE"
+    cat "$STUB/pulse.calls" 2>/dev/null
+)
+check "says it removed the stale pid file" "removed a stale pid file (pid 1 " "$out"
+check "the pid file is really gone"        "PIDFILE-GONE"                   "$out"
+check "then starts and listens"            "listening on 127.0.0.1:4713"    "$out"
+check "returns success"                    "rc=0"                           "$out"
+check "starts with PULSE_SERVER cleared"   "PULSE_SERVER=unset --start"     "$out"
+check "sends the daemon's log to a file"   "log-target=file:$STUB/pulse.log" "$out"
+
+echo
+echo "pulse: only a pid that is no longer a pulseaudio counts as stale"
+out=$(
+    load
+    mkdir -p "$STUB/live"; cp "$(command -v sleep)" "$STUB/live/pulseaudio"
+    "$STUB/live/pulseaudio" 10 >/dev/null 2>&1 &
+    live=$!
+    for _ in $(seq 1 50); do
+        [ "$(cat "/proc/$live/comm" 2>/dev/null)" = pulseaudio ] && break
+        sleep 0.1
+    done
+    echo "$live" > "$STUB/live.pid"
+    pulse_pid_stale "$STUB/live.pid" && echo "LIVE-STALE" || echo "LIVE-KEPT"
+    echo 99999999 > "$STUB/dead.pid"
+    pulse_pid_stale "$STUB/dead.pid" && echo "DEAD-STALE" || echo "DEAD-KEPT"
+    : > "$STUB/empty.pid"
+    pulse_pid_stale "$STUB/empty.pid" && echo "EMPTY-STALE" || echo "EMPTY-KEPT"
+    kill "$live" 2>/dev/null
+)
+check "a running pulseaudio is left alone" "LIVE-KEPT"   "$out"
+check "a pid that does not exist is stale" "DEAD-STALE"  "$out"
+check "an empty pid file is stale"         "EMPTY-STALE" "$out"
+
+echo
+echo "pulse: the pid file is looked for where PulseAudio itself looks"
+out=$(
+    load; pulse_home
+    mkdir -p "$HOME/.config/pulse/abc-runtime"; : > "$HOME/.config/pulse/abc-runtime/pid"
+    echo "legacy: $(pulse_pid_files)"
+    XDG_RUNTIME_DIR=/run/user/9 pulse_pid_files | sed 's/^/xdg: /'
+    PULSE_RUNTIME_PATH=/custom XDG_RUNTIME_DIR=/run/user/9 pulse_pid_files | sed 's/^/explicit: /'
+)
+check "falls back to the config-dir link" "legacy: $STUB/home/.config/pulse/abc-runtime/pid" "$out"
+check "honours XDG_RUNTIME_DIR"           "xdg: /run/user/9/pulse/pid"   "$out"
+check "PULSE_RUNTIME_PATH wins"           "explicit: /custom/pid"        "$out"
+
+echo
+echo "pulse: already listening"
+out=$(
+    PATH="$STUB:$PATH"; make_pulse starts; pulse_home
+    PULSE_LOG="$STUB/pulse.log"; load
+    port_open() { return 0; }
+    pulse_up 2>&1; echo "rc=$?"
+    [ -e "$STUB/pulse.calls" ] && echo "STARTED-AGAIN"
+)
+check "reports it is already listening" "already running and listening on 127.0.0.1:4713" "$out"
+check "returns success"                 "rc=0"          "$out"
+refute "does not start a second one"    "STARTED-AGAIN" "$out"
+
+echo
+echo "pulse: running, but without the TCP listener"
+out=$(
+    PATH="$STUB:$PATH"; make_pulse running; pulse_home
+    PULSE_LOG="$STUB/pulse.log"; load
+    port_open() { return 1; }
+    pulse_up 2>&1; echo "rc=$?"
+    [ -e "$STUB/pulse.calls" ] && echo "STARTED-AGAIN"
+)
+check "says it is not on the port"   "but not on 127.0.0.1:4713" "$out"
+check "says how to fix it"           "pulseaudio -k"             "$out"
+check "returns non-zero"             "rc=1"                      "$out"
+refute "does not start a second one" "STARTED-AGAIN"             "$out"
+
+echo
+echo "pulse: fails to start"
+out=$(
+    PATH="$STUB:$PATH"; make_pulse fails; pulse_home
+    PULSE_LOG="$STUB/pulse.log"; load
+    port_open() { return 1; }
+    pulse_up 2>&1; echo "rc=$?"
+)
+check "says it did not start"         "PulseAudio did not start"       "$out"
+check "shows the daemon's own reason" "pa_pid_file_create() failed"    "$out"
+check "says how to see more"          "pulseaudio -vv --daemonize=no"  "$out"
+check "returns non-zero"              "rc=1"                           "$out"
+
+echo
+echo "pulse: starts, but never listens"
+out=$(
+    PATH="$STUB:$PATH"; make_pulse starts; pulse_home
+    PULSE_LOG="$STUB/pulse.log"; load
+    port_open() { return 1; }
+    sleep() { :; }
+    pulse_up 2>&1; echo "rc=$?"
+)
+check "says it is not listening" "started but is not listening on 127.0.0.1:4713" "$out"
+refute "does not claim success"  "ok    listening"  "$out"
+check "returns non-zero"         "rc=1"             "$out"
+
+echo
+echo "pulse: not installed"
+out=$(
+    load; pulse_home
+    have() { [ "$1" != pulseaudio ] && command -v "$1" >/dev/null 2>&1; }
+    pulse_up 2>&1; echo "rc=$?"
+)
+check "says it is not installed" "pulseaudio not installed" "$out"
+check "says how to install it"   "pkg install pulseaudio"   "$out"
+check "returns non-zero"         "rc=1"                     "$out"
+
+# ==========================================================================
 # A full run, with every external command stubbed. This is the only way to
 # exercise the whole script: run for real it stops the X server and replaces
 # the running desktop, so it can never be tested on the machine it works on.
