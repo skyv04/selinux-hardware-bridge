@@ -42,7 +42,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <unistd.h>
 
@@ -77,6 +79,24 @@ static int bridge_port(void) {
     const char *e = getenv("BRIDGE_PORT");
     int v = e ? atoi(e) : 0;
     return v > 0 ? v : 7878;
+}
+
+/* How far a live microphone may fall behind before late audio is dropped;
+ * 0 keeps every sample however late it is. */
+static int mic_max_latency_ms(void) {
+    const char *e = getenv("BRIDGE_MIC_MAX_LATENCY_MS");
+    if (!e || !*e) return 200;
+    char *end;
+    errno = 0;
+    long v = strtol(e, &end, 10);
+    /* A typo must not quietly switch the bound off. */
+    if (end == e || *end || errno) {
+        fprintf(stderr, "warning: BRIDGE_MIC_MAX_LATENCY_MS=%s is not a whole "
+                        "number of milliseconds; using 200\n", e);
+        return 200;
+    }
+    if (v <= 0) return 0;
+    return v > 3600000 ? 3600000 : (int)v;
 }
 
 static int write_all(int fd, const void *buf, size_t n) {
@@ -431,6 +451,39 @@ static int run_capture_session(int sock, const struct session *s, FILE *fout) {
     long units = 0, bytes = 0;
     int rc = RC_OK;
 
+    /*
+     * A live microphone has to stay live. The phone records against its
+     * own clock and nothing downstream reads faster than real time, so audio
+     * that piles up -- this side stalled for a moment, the container was
+     * frozen while the app kept recording, or the two clocks disagree -- is
+     * never caught up. It waits in the socket and the pipe, and the
+     * microphone stays that far behind for the rest of the session.
+     * Measured here: a pipeline that had been up for seven hours delivered
+     * a test tone 7.7 s after it was played, so a call would have heard
+     * every word 7.7 s late. When the audio still waiting in the socket and
+     * in the pipe exceeds the bound, the chunk just read -- the oldest one
+     * in flight -- is dropped instead of written. A gap is heard once; a
+     * delay is wrong for the rest of the call.
+     *
+     * Once over the bound, dropping continues down to a quarter of it.
+     * Nothing ever shrinks the queue again, so stopping just under the
+     * bound would leave the line riding it for good: measured, the pipe
+     * then sat at 188-288 ms, every one of them heard as delay.
+     *
+     * Only a live (unlimited) capture into a pipe or FIFO is governed. A
+     * file is a recording, and a recording wants every sample.
+     */
+    int out_fd = fileno(fout);
+    int max_late_ms = 0;
+    if (!is_video && s->bitrate == 0) {
+        struct stat st;
+        if (fstat(out_fd, &st) == 0 && S_ISFIFO(st.st_mode))
+            max_late_ms = mic_max_latency_ms();
+    }
+    long max_queued = 0;          /* bytes; set once the format is known */
+    double bytes_per_sec = 0;
+    long dropped = 0, drop_run = 0, drop_runs = 0;
+
     for (;;) {
         int32_t len;
         if (read_i32(sock, &len) != 0) {
@@ -463,6 +516,12 @@ static int run_capture_session(int sock, const struct session *s, FILE *fout) {
                 }
             } else {
                 fprintf(stderr, "capturing %dHz x%d s16le\n", a, b);
+                bytes_per_sec = (double)a * (b > 0 ? b : 1) * 2;
+                if (max_late_ms > 0 && a > 0) {
+                    max_queued = (long)(bytes_per_sec * max_late_ms / 1000);
+                    fprintf(stderr, "live: audio more than %d ms late is dropped\n",
+                            max_late_ms);
+                }
             }
             announced = 1;
             continue;
@@ -483,6 +542,26 @@ static int run_capture_session(int sock, const struct session *s, FILE *fout) {
             free(buf);
             rc = io_timed_out ? RC_TIMEOUT : RC_ERR;
             break;
+        }
+        if (max_queued > 0) {
+            /* Newer audio still in the socket plus older audio the reader
+             * has not taken yet: that sum is how late this chunk would be
+             * heard. A failed query counts as nothing queued. */
+            int in_sock = 0, in_pipe = 0;
+            if (ioctl(sock, FIONREAD, &in_sock) != 0) in_sock = 0;
+            if (ioctl(out_fd, FIONREAD, &in_pipe) != 0) in_pipe = 0;
+            if ((long)in_sock + in_pipe > (drop_run > 0 ? max_queued / 4 : max_queued)) {
+                if (drop_run == 0) drop_runs++;
+                drop_run += len;
+                dropped += len;
+                free(buf);
+                continue;
+            }
+            if (drop_run > 0) {
+                fprintf(stderr, "dropped %.2f s of late audio to stay live\n",
+                        drop_run / bytes_per_sec);
+                drop_run = 0;
+            }
         }
         if (is_video && s->y4m) fputs("FRAME\n", fout);
         if (fwrite(buf, 1, (size_t)len, fout) != (size_t)len) {
@@ -514,6 +593,9 @@ static int run_capture_session(int sock, const struct session *s, FILE *fout) {
     }
     fprintf(stderr, "%s: %ld unit(s), %ld byte(s)\n",
             is_video ? "camera" : "microphone", units, bytes);
+    if (dropped > 0)
+        fprintf(stderr, "microphone: dropped %.2f s of late audio in %ld gap(s)\n",
+                dropped / bytes_per_sec, drop_runs);
     return rc;
 }
 
@@ -751,10 +833,14 @@ static void usage(const char *prog) {
         "  \"-\"    as a filename means stdin/stdout\n"
         "  decode dimensions are optional: the bridge announces the real\n"
         "  picture size, and reports it again if it changes mid-stream\n"
+        "  a live mic (<seconds> 0) written to a pipe or FIFO stays live:\n"
+        "  audio more than BRIDGE_MIC_MAX_LATENCY_MS late is dropped\n"
+        "  (0 keeps every sample; files are never trimmed)\n"
         "\n"
-        "env: BRIDGE_TIMEOUT=%d  BRIDGE_RETRIES=%d  BRIDGE_PORT=%d\n",
+        "env: BRIDGE_TIMEOUT=%d  BRIDGE_RETRIES=%d  BRIDGE_PORT=%d\n"
+        "     BRIDGE_MIC_MAX_LATENCY_MS=%d\n",
         prog, prog, prog, prog, prog, prog,
-        timeout_secs(), retry_count(), bridge_port());
+        timeout_secs(), retry_count(), bridge_port(), mic_max_latency_ms());
 }
 
 int main(int argc, char **argv) {

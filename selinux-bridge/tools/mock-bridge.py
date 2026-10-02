@@ -28,6 +28,10 @@ Env:    MOCK_RESIZE_AT=N   halve the picture size from decoded frame N on
         MOCK_CAMERAS=N     how many cameras to pretend exist (default 2)
         MOCK_SENSOR_ORIENTATION=D  sensor mounting angle for "auto" (default 90)
         MOCK_CAMERA_EXACT=1  honour the requested size instead of rounding
+        MOCK_MIC_BACKLOG_S=N  start a live microphone with N seconds of stale
+                            audio already queued (constant 4242, where live
+                            audio is a sine), the way a stalled reader
+                            leaves it on a real phone
 """
 import os
 import math
@@ -55,6 +59,11 @@ MOCK_CAMERAS = int(os.environ.get("MOCK_CAMERAS", "2"))
 MOCK_SENSOR_ORIENTATION = int(os.environ.get("MOCK_SENSOR_ORIENTATION", "90"))
 # Off by default so the mock rounds the requested size like a real HAL does.
 CAMERA_EXACT = os.environ.get("MOCK_CAMERA_EXACT", "") not in ("", "0")
+# Seconds of stale audio a live microphone session starts with. The phone
+# keeps recording while this side is stalled, and that backlog is what makes
+# a microphone permanently late if nothing ever discards it.
+MIC_BACKLOG_S = float(os.environ.get("MOCK_MIC_BACKLOG_S", "0"))
+MIC_BACKLOG_VALUE = 4242
 
 # Wire codec id -> (ffmpeg encoder, decoder demuxer, component name)
 CODECS = {
@@ -352,6 +361,10 @@ def handle_mic(conn, rate, channels, max_seconds, source):
 
     seconds = max_seconds if max_seconds > 0 else 0
     chunk_samples = rate // 10
+    if seconds == 0 and MIC_BACKLOG_S > 0:
+        stale = struct.pack("<h", MIC_BACKLOG_VALUE) * (chunk_samples * channels)
+        for _ in range(int(MIC_BACKLOG_S * 10)):
+            conn.sendall(struct.pack(">i", len(stale)) + stale)
     i = 0
     while seconds == 0 or i < seconds * 10:
         # A 440 Hz sine, so a listener can tell real audio from zeros.

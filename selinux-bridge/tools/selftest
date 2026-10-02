@@ -590,6 +590,84 @@ else
     bad "captured audio was entirely zero"
 fi
 
+# A live microphone must not stay as late as the worst stall it ever saw.
+# The mock starts the session with 5 s of stale audio (constant 4242) queued
+# ahead of the live sine, which is what a reader that stalled leaves behind on
+# a real phone. Reading the FIFO at real-time pace for 1.5 s, a governed
+# client hands over at most a couple of stale chunks; an ungoverned one hands
+# over nothing but stale audio, 5 s behind.
+BACKLOG_PORT=$((PORT + 8))
+MOCK_MIC_BACKLOG_S=5 python3 tools/mock-bridge.py "$BACKLOG_PORT" \
+    >"$TMP/backlog.log" 2>&1 &
+PIDS+=($!)
+sleep 2
+cat >"$TMP/rt-reader.py" <<'EOF'
+import struct, sys, time
+f = open(sys.argv[1], "rb", buffering=0)
+stale = live = 0
+t0 = time.monotonic()
+for i in range(15):
+    got = b""
+    while len(got) < 9600:
+        d = f.read(9600 - len(got))
+        if not d:
+            break
+        got += d
+    if len(got) < 9600:
+        break
+    if all(v == 4242 for v in struct.unpack("<4800h", got)):
+        stale += 1
+    else:
+        live += 1
+    time.sleep(max(0.0, t0 + (i + 1) * 0.1 - time.monotonic()))
+print(stale, live)
+EOF
+live_mic_read() { # live_mic_read <tag> [env...]: prints "<stale> <live>"
+    local tag=$1; shift
+    rm -f "$TMP/$tag.fifo"; mkfifo "$TMP/$tag.fifo"
+    env "$@" BRIDGE_PORT=$BACKLOG_PORT ./bridge_client mic 48000 1 0 \
+        "$TMP/$tag.fifo" >/dev/null 2>"$TMP/$tag.err" &
+    local cpid=$!
+    timeout 20 python3 "$TMP/rt-reader.py" "$TMP/$tag.fifo"
+    kill "$cpid" 2>/dev/null; wait "$cpid" 2>/dev/null
+}
+read -r st lv <<<"$(live_mic_read governed)"
+if [ "${st:-99}" -le 3 ] && [ "${lv:-0}" -ge 12 ]; then
+    ok "a live microphone sheds a stalled backlog ($st stale, $lv live chunks)"
+else
+    bad "a live microphone stayed late: ${st:-?} stale, ${lv:-?} live chunks"
+fi
+if grep -q "dropped .* s of late audio to stay live" "$TMP/governed.err"; then
+    ok "dropping late audio is reported, not silent"
+else
+    bad "late audio was dropped without a word in the log"
+fi
+read -r st lv <<<"$(live_mic_read ungoverned BRIDGE_MIC_MAX_LATENCY_MS=0)"
+if [ "${st:-0}" = 15 ]; then
+    ok "BRIDGE_MIC_MAX_LATENCY_MS=0 keeps every sample, however late"
+else
+    bad "BRIDGE_MIC_MAX_LATENCY_MS=0 still dropped audio (${st:-?} stale, ${lv:-?} live)"
+fi
+read -r st lv <<<"$(live_mic_read typo BRIDGE_MIC_MAX_LATENCY_MS=20O)"
+if [ "${st:-99}" -le 3 ] && grep -q "not a whole number" "$TMP/typo.err"; then
+    ok "a mistyped BRIDGE_MIC_MAX_LATENCY_MS warns and keeps the bound"
+else
+    bad "a mistyped BRIDGE_MIC_MAX_LATENCY_MS switched the bound off quietly (${st:-?} stale)"
+fi
+# A file is a recording: even a live one must keep the backlog.
+BRIDGE_PORT=$BACKLOG_PORT timeout 2 ./bridge_client mic 48000 1 0 \
+    "$TMP/backlog.pcm" >/dev/null 2>&1
+if python3 -c "
+import struct, sys
+d = open('$TMP/backlog.pcm', 'rb').read()
+n = len(d) // 9600
+stale = sum(1 for i in range(n) if all(v == 4242 for v in struct.unpack('<4800h', d[i*9600:(i+1)*9600])))
+sys.exit(0 if stale == 50 else 1)" 2>/dev/null; then
+    ok "a live capture into a file keeps every sample"
+else
+    bad "a live capture into a file lost part of the backlog"
+fi
+
 # A denied runtime grant is the likeliest real-world failure and must arrive
 # as a readable error at handshake time, not as an empty stream.
 DENY_PORT=$((PORT + 6))

@@ -34,6 +34,19 @@
 #   inside this container and inside Termux, and failed with nothing but
 #   "Module initialization failed" when it did not.
 #
+# Why the feed throws away audio that arrives late:
+#
+#   Nothing in this chain can read faster than real time -- pacat plays the
+#   FIFO at exactly the sample rate -- so a backlog that builds up in front
+#   of it (in the phone's socket or in the FIFO) is never worked off. One
+#   stall is enough. Measured here: the microphone ran a steady 7.7 s behind
+#   the room long after the stall had passed, while PulseAudio itself
+#   reported 37.5 ms. A call partner hears every word, eight seconds late.
+#   bridge_client therefore drops audio that is more than
+#   BRIDGE_MIC_MAX_LATENCY_MS (default 200) behind whenever it writes into a
+#   pipe, and logs each gap in mic.log. BRIDGE_MIC_MAX_LATENCY_MS=0 keeps
+#   every sample however late.
+#
 # Usage:
 #   bridge-mic [-s SOURCE] [-r RATE] [-c CHANNELS] [start|stop|status]
 #
@@ -331,12 +344,22 @@ pin_stream_to_sink "$PACAT_PID" "$SINK_NAME" || true
 # looks exactly like a broken microphone.
 pactl set-default-source "$SOURCE_NAME" >/dev/null 2>&1
 
+MAX_LATE="${BRIDGE_MIC_MAX_LATENCY_MS:-200}"
+# Same reading as bridge_client: not a whole number means the default.
+[[ "$MAX_LATE" =~ ^[+-]?[0-9]+$ ]] || MAX_LATE=200
+if [ "$((10#${MAX_LATE#[+-]}))" -gt 0 ] && [ "${MAX_LATE:0:1}" != "-" ]; then
+    LATE_NOTE="audio more than $((10#${MAX_LATE#[+-]})) ms behind is dropped (logged)"
+else
+    LATE_NOTE="every sample is kept however late (BRIDGE_MIC_MAX_LATENCY_MS=$MAX_LATE)"
+fi
+
 cat <<EOF
 microphone bridge running
   source:  $SOURCE ($RATE Hz, $CHANNELS ch, s16le)
   pulse:   $SOURCE_NAME (now the default source)
   monitor: $MONITOR_NAME (same audio, hidden from some apps)
   latency: ${LATENCY_MS} ms
+  late:    $LATE_NOTE
   fifo:    $FIFO (container-local)
 
 Check it:
