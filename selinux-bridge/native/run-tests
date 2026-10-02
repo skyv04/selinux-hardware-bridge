@@ -12,7 +12,7 @@
 # bug worth catching here was in the interaction between a real application
 # and a real camera, not in anything a stub would exercise.
 #
-# Usage: native/run-tests [ffmpeg|twoopen|reacq|dupfd|vlc|udev|crossing]...
+# Usage: native/run-tests [ffmpeg|twoopen|reacq|dupfd|vlc|udev|crossing|launchers]...
 #        (default: all)
 #
 set -uo pipefail
@@ -200,6 +200,43 @@ t_crossing() {
                    || bad "termux-run did not return 127 for an unknown command"
 }
 
+# The doctor's launcher sweep, against one fixture per form it has to judge.
+# Half are real bugs it must catch; half are the false alarms it once raised
+# on a healthy system (comments, compiled programs, Python guards).
+t_launchers() {
+    echo "launcher sweep (finds unguarded crossings, ignores false alarms)"
+    local d="$TMP/launchers" am=/data/data/com.termux/files/usr/bin/am
+    mkdir -p "$d"
+    printf '#!/bin/sh\nexec env -u LD_LIBRARY_PATH %s start x\n' "$am" > "$d/bad-one-var"
+    printf '#!/bin/sh\nLD_PRELOAD=/x.so %s start x\n' "$am"              > "$d/bad-sets-it"
+    printf '#!/usr/bin/env python3\nimport os,subprocess\nsubprocess.run(["%s","start"],env=os.environ)\n' "$am" > "$d/bad-python"
+    printf '#!/bin/sh\nexec env -u LD_LIBRARY_PATH -u LD_PRELOAD %s start x\n' "$am" > "$d/ok-env-u"
+    printf '#!/bin/sh\nunset LD_LIBRARY_PATH LD_PRELOAD\nexec %s start x\n' "$am" > "$d/ok-unset"
+    printf '#!/bin/sh\nexec termux-run am start x\n'                     > "$d/ok-termux-run"
+    printf '#!/usr/bin/env python3\nimport os,subprocess\nAM="%s"\nenv={k:v for k,v in os.environ.items()\n     if k not in ("LD_PRELOAD", "LD_LIBRARY_PATH")}\nsubprocess.run([AM],env=env)\n' "$am" > "$d/ok-python-filter"
+    printf '#!/usr/bin/env python3\nimport os\ne=dict(os.environ); e.pop("LD_PRELOAD",None)\nos.execve("%s",["am"],e)\n' "$am" > "$d/ok-python-pop"
+    printf '#!/bin/sh\n# Note: Termux keeps its NSS db in /data/data/com.termux/files/home\nexec chromium "$@"\n' > "$d/skip-comment-only"
+    printf '\177ELF\0\0\0%s\0\0' "$am" > "$d/skip-compiled"
+
+    local out; out="$("$HERE/hw-enable" scan-launchers "$d")"
+    local f want
+    for f in bad-one-var bad-sets-it bad-python; do
+        printf '%s\n' "$out" | grep -qx "risky $d/$f" \
+            && ok "flags $f" || bad "missed a real bug: $f"
+    done
+    for f in ok-env-u ok-unset ok-termux-run ok-python-filter ok-python-pop \
+             skip-comment-only skip-compiled; do
+        printf '%s\n' "$out" | grep -qx "risky $d/$f" \
+            && bad "false alarm on $f" || ok "accepts $f"
+    done
+    want=8   # every file but the comment-only script and the binary
+    printf '%s\n' "$out" | grep -qx "scanned $want" \
+        && ok "counts only real crossings ($want)" \
+        || bad "expected 'scanned $want', got '$(printf '%s\n' "$out" | tail -1)'"
+    "$HERE/hw-enable" scan-launchers "$d" >/dev/null && bad "exit 0 despite risky launchers" \
+                                                     || ok "nonzero exit when any launcher is risky"
+}
+
 run() {
     case "$1" in
         ffmpeg)   t_ffmpeg ;;
@@ -209,6 +246,7 @@ run() {
         vlc)      t_vlc ;;
         udev)     t_udev ;;
         crossing) t_crossing ;;
+        launchers) t_launchers ;;
         *) echo "unknown test: $1" >&2; exit 2 ;;
     esac
 }
@@ -216,7 +254,7 @@ run() {
 if [ "$#" -gt 0 ]; then
     for t in "$@"; do run "$t"; done
 else
-    for t in ffmpeg twoopen reacq dupfd vlc udev crossing; do run "$t"; done
+    for t in ffmpeg twoopen reacq dupfd vlc udev crossing launchers; do run "$t"; done
 fi
 
 echo ""

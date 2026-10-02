@@ -24,7 +24,7 @@
 # Everything here is idempotent and reversible: `uninstall` puts the machine
 # back exactly as it was.
 #
-# Usage: hw-enable [install|uninstall|status|doctor]
+# Usage: hw-enable [install|uninstall|status|doctor|scan-launchers [dir...]]
 #
 set -uo pipefail
 
@@ -641,6 +641,40 @@ do_status() {
 # ----------------------------------------------------------------- doctor ---
 
 # Proves each path end to end rather than reporting that a file exists.
+# Find scripts that run a Termux/Android binary without clearing LD_PRELOAD.
+# Prints "risky <path>" for each, then "scanned <n>". Used by doctor, and on
+# its own as "hw-enable scan-launchers [dir...]" so it can be tested quickly.
+#
+# Three things look like a crossing and are not, and a check that cries wolf
+# is a check people learn to ignore:
+#   - compiled programs, which carry such paths as data (grep -I skips them);
+#   - comments, which mention a path without running anything;
+#   - guards written in another language. Python, for instance, clears the
+#     variables by filtering them out of the environment it passes on.
+scan_launchers() {
+    local d f code n=0
+    local cleared='-u[[:space:]]+LD_PRELOAD'
+    cleared+='|unset[[:space:]]+([A-Za-z_]+[[:space:]]+)*LD_PRELOAD'
+    cleared+="|pop\\([\"']LD_PRELOAD"
+    cleared+="|not in [({\\[][^)}]*[\"']LD_PRELOAD"
+    cleared+="|del [A-Za-z_.]+\\[[\"']LD_PRELOAD"
+    for d in "$@"; do
+        [ -d "$d" ] || continue
+        for f in "$d"/*; do
+            [ -f "$f" ] && [ -r "$f" ] || continue
+            [ "${f##*/}" = termux-run ] && continue   # the helper itself
+            grep -Iq . "$f" 2>/dev/null || continue
+            code="$(grep -vE '^[[:space:]]*#' "$f" 2>/dev/null)"
+            printf '%s\n' "$code" | grep -qE 'com\.termux/files|termux-open|termux-run' || continue
+            n=$((n + 1))
+            printf '%s\n' "$code" | grep -q 'termux-run' && continue
+            printf '%s\n' "$code" | grep -qE -- "$cleared" && continue
+            printf 'risky %s\n' "$f"
+        done
+    done
+    printf 'scanned %s\n' "$n"
+}
+
 do_doctor() {
     local fails=0
 
@@ -842,25 +876,12 @@ do_doctor() {
         # sweeps the places launchers actually live, so a script written
         # today with the old one-variable habit is caught here rather than by
         # someone double-clicking an icon and getting silence.
-        local scanned=0 risky=0 d f
-        for d in "$HOME/.local/bin" "$HOME/bin" "$LOCAL_BIN" \
-                 "$HOME/.config/autostart"; do
-            [ -d "$d" ] || continue
-            for f in "$d"/*; do
-                [ -f "$f" ] || continue
-                [ -r "$f" ] || continue
-                case "$f" in *termux-run) continue ;; esac
-                grep -qE 'com\.termux/files|termux-open' "$f" \
-                    2>/dev/null || continue
-                scanned=$((scanned + 1))
-                if grep -q 'termux-run' "$f" 2>/dev/null; then continue; fi
-                if grep -qE '[-]u[[:space:]]+LD_PRELOAD' "$f" 2>/dev/null; then
-                    continue
-                fi
-                risky=$((risky + 1))
-                printf '        %s\n' "$f"
-            done
-        done
+        local risky_list scanned risky
+        risky_list="$(scan_launchers "$HOME/.local/bin" "$HOME/bin" \
+                        "$LOCAL_BIN" "$HOME/.config/autostart")"
+        scanned="$(printf '%s\n' "$risky_list" | sed -n 's/^scanned //p')"
+        risky="$(printf '%s\n' "$risky_list" | grep -c '^risky ')"
+        printf '%s\n' "$risky_list" | sed -n 's/^risky /        /p'
         if [ "$risky" -gt 0 ]; then
             bad "$risky of $scanned launcher(s) reach Android without clearing LD_PRELOAD"
             printf '        listed above. They will die in the linker and\n'
@@ -895,5 +916,12 @@ case "${1:-status}" in
     uninstall) do_uninstall ;;
     status)    do_status ;;
     doctor)    do_doctor ;;
-    *) say "usage: hw-enable [install|uninstall|status|doctor]" >&2; exit 2 ;;
+    scan-launchers)
+        shift
+        [ "$#" -gt 0 ] || set -- "$HOME/.local/bin" "$HOME/bin" "$LOCAL_BIN" \
+                                "$HOME/.config/autostart"
+        out="$(scan_launchers "$@")"
+        printf '%s\n' "$out"
+        ! printf '%s\n' "$out" | grep -q '^risky ' ;;
+    *) say "usage: hw-enable [install|uninstall|status|doctor|scan-launchers [dir...]]" >&2; exit 2 ;;
 esac
