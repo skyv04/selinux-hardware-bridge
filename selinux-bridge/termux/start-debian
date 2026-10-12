@@ -4,9 +4,10 @@
 #                 own hardware attached: Adreno GPU, camera, microphone and
 #                 the Qualcomm video codecs.
 #
-# This runs on the *Termux* side, not inside the container. It starts the X
-# server, the audio server, the companion bridge app and then the desktop
-# session, in that order, because each one depends on the one before it.
+# This runs on the *Termux* side, not inside the container. It starts the
+# audio server, the companion bridge app, the X server and then the desktop
+# session, in that order. The bridge app comes before the X server on
+# purpose: it has to be opened while Termux is still on screen (bridge_up).
 #
 # It is deliberately talkative. Every step says what it is doing, and every
 # failure says whether the run can continue without it and what you would
@@ -107,7 +108,9 @@ Everything is automatic. These environment variables change the defaults:
                                                 (default: $SESSION_LAUNCHER)
 
 The companion app provides the camera, microphone and hardware codecs. It is
-optional: without it the desktop still starts, just without those. See
+opened for a moment on every start, because that is what keeps Android
+handing it the camera and microphone. It is optional: without it the
+desktop still starts, just without those. See
   $BRIDGE_REPO
 USAGE
     exit 0
@@ -153,14 +156,28 @@ bridge_not_installed() {
     info "continuing without it..."
 }
 
-bridge_up() {
-    if port_open "$BRIDGE_PORT"; then
-        ok "already running and listening on 127.0.0.1:$BRIDGE_PORT"
-        return 0
-    fi
+# The app is opened on every run, even when its service is already
+# listening, and before step 8 hands the screen to Termux:X11. Listening is
+# not enough: Android lets a foreground service use the camera and the
+# microphone only if the service was started while its app was on screen.
+# When Android restarts the service by itself -- after reclaiming its
+# memory, say -- it does so in the background, and from then on the port
+# still answers and the permissions still read "granted", yet every capture
+# fails with "Camera disabled by policy" and the microphone records silence.
+# Opening the activity runs its onCreate, which starts the service again
+# from the foreground, and that hands both back for as long as the service
+# lives. Two details make that happen:
+#   * NEW_TASK|CLEAR_TASK, so it is a fresh onCreate. Bringing the old
+#     window forward only resumes it, which restores nothing.
+#   * Termux on screen. Android may silently drop an activity launch from an
+#     app it cannot see, and `am` reports success either way. Until step 8,
+#     Termux is still the window this command was typed into.
+BRIDGE_LAUNCH_FLAGS=0x10008000  # FLAG_ACTIVITY_NEW_TASK | FLAG_ACTIVITY_CLEAR_TASK
 
+bridge_up() {
     local am_out am_rc
-    am_out=$(am start --user 0 -n "$BRIDGE_PKG/$BRIDGE_ACTIVITY" 2>&1)
+    am_out=$(am start --user 0 -f "$BRIDGE_LAUNCH_FLAGS" \
+                 -n "$BRIDGE_PKG/$BRIDGE_ACTIVITY" </dev/null 2>&1)
     am_rc=$?
 
     if [ "$am_rc" -ne 0 ] || printf '%s' "$am_out" | grep -q 'does not exist'; then
@@ -168,13 +185,18 @@ bridge_up() {
         return 1
     fi
 
-    # The app launched. Wait for the socket rather than assuming: being
-    # started and being ready to serve are not the same thing, and the usual
-    # reason it never listens is that its permissions were declined.
+    # Leave it on screen long enough for onCreate to restart the service.
+    # Then wait for the socket rather than assuming: being started and being
+    # ready to serve are not the same thing, and the usual reason it never
+    # listens is that its permissions were declined.
+    sleep 3
     local i
     for i in $(seq 1 "$BRIDGE_WAIT"); do
         if port_open "$BRIDGE_PORT"; then
-            ok "listening on 127.0.0.1:$BRIDGE_PORT"
+            ok "opened, and listening on 127.0.0.1:$BRIDGE_PORT"
+            info "opening it from Termux is what keeps Android handing it the"
+            info "camera and microphone. If its window did not appear just now,"
+            info "tap its notification once."
             return 0
         fi
         sleep 1
@@ -424,10 +446,20 @@ step 5 "Starting PulseAudio (TCP on loopback)..."
 pulse_up || true
 
 # --------------------------------------------------------------------------
-# [6] X server
+# [6] The companion bridge app
+# --------------------------------------------------------------------------
+# Before the X server takes the screen, not after it: see bridge_up. Once
+# the app has had its moment, Termux is brought back to the front, so that
+# step 8's launch of Termux:X11 also comes from the app on screen.
+step 6 "Opening the SELinux Hardware Bridge app..."
+bridge_up || true
+am start --user 0 -n com.termux/.app.TermuxActivity </dev/null >/dev/null 2>&1 || true
+
+# --------------------------------------------------------------------------
+# [7] X server
 # --------------------------------------------------------------------------
 # Fatal. Without a display there is no desktop to start.
-step 6 "Launching the Termux:X11 server on :$DISPLAY_NUM..."
+step 7 "Launching the Termux:X11 server on :$DISPLAY_NUM..."
 export XDG_RUNTIME_DIR="$TMPDIR"
 termux-x11 ":$DISPLAY_NUM" >/dev/null 2>&1 &
 sleep 3
@@ -442,7 +474,7 @@ if ! pgrep -f termux-x11 >/dev/null; then
 fi
 ok "running"
 
-step 7 "Bringing the Termux:X11 window to the foreground..."
+step 8 "Bringing the Termux:X11 window to the foreground..."
 if am start --user 0 -n com.termux.x11/com.termux.x11.MainActivity \
      >/dev/null 2>&1; then
     ok "foregrounded"
@@ -450,12 +482,6 @@ else
     warn "could not foreground the Termux:X11 app; open it by hand"
 fi
 sleep 1
-
-# --------------------------------------------------------------------------
-# [8] The companion bridge app
-# --------------------------------------------------------------------------
-step 8 "Starting the SELinux Hardware Bridge app..."
-bridge_up || true
 
 # --------------------------------------------------------------------------
 # [9] The desktop session

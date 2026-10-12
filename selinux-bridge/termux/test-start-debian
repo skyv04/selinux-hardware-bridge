@@ -34,10 +34,13 @@ refute() { # refute <name> <forbidden-substring> <actual>
 # --- stub `am` -------------------------------------------------------------
 # Behaves like the real one: exit 0 and "Starting:" when the package is
 # there, exit 2 and "does not exist" when it is not. Both were measured
-# against the real `am` on-device before being written down here.
+# against the real `am` on-device before being written down here. Every call
+# is recorded in $STUB/am.calls, one line of arguments each.
 make_am() { # make_am <installed|missing>
+    rm -f "$STUB/am.calls"
     cat > "$STUB/am" <<EOF
 #!/bin/sh
+echo "\$*" >> "$STUB/am.calls"
 if [ "$1" = installed ]; then
     echo "Starting: Intent { cmp=\$3 }"
     exit 0
@@ -54,16 +57,24 @@ EOF
 load() { START_DEBIAN_LIB=1 . "$SCRIPT"; }
 
 # ==========================================================================
-echo "bridge: already listening"
+echo "bridge: already listening -- opened anyway, afresh"
+# A listening service can still be one Android restarted in the background,
+# which gets no camera or microphone until the app's onCreate restarts it.
 out=$(
-    PATH="$STUB:$PATH"; make_am missing            # am must not even be used
+    PATH="$STUB:$PATH"; make_am installed
     load
+    sleep() { :; }
     port_open() { return 0; }
     bridge_up 2>&1; echo "rc=$?"
+    cat "$STUB/am.calls"
 )
-check "reports it is already running" "already running and listening" "$out"
-check "returns success"               "rc=0"                          "$out"
-refute "does not try to launch it"    "not installed"                 "$out"
+check "reports it open and listening" "opened, and listening on 127.0.0.1:7878" "$out"
+check "returns success"               "rc=0"                                "$out"
+check "launches it even so"           "com.selinuxbridge.app/.MainActivity" "$out"
+check "as a fresh task, so onCreate runs" \
+      "start --user 0 -f 0x10008000 -n com.selinuxbridge.app/.MainActivity" "$out"
+check "says the notification is the fallback" "tap its notification"       "$out"
+refute "does not claim it is missing" "not installed"                       "$out"
 
 # ==========================================================================
 echo
@@ -143,6 +154,20 @@ for leak in drshamavu /home/drshamavu; do
 done
 check "user is detected, not hard-coded" "DEBIAN_USER=\${DEBIAN_USER:-}" "$out"
 check "guest home is derived"            "GUEST_HOME=/home/\$DEBIAN_USER" "$out"
+
+# ==========================================================================
+echo
+echo "the bridge app is opened while Termux still has the screen"
+# Android may drop a launch from an app it cannot see, so the bridge has to
+# be opened before Termux:X11 is brought forward, and Termux brought back
+# after it so that that launch, too, comes from the app on screen.
+line_of() { grep -n -m1 -F -- "$1" "$SCRIPT" | cut -d: -f1; }
+b=$(line_of 'bridge_up || true')
+t=$(line_of 'am start --user 0 -n com.termux/.app.TermuxActivity')
+x=$(line_of 'am start --user 0 -n com.termux.x11/com.termux.x11.MainActivity')
+check "bridge, then Termux back, then Termux:X11" "ordered" \
+      "$([ -n "$b" ] && [ -n "$t" ] && [ -n "$x" ] && [ "$b" -lt "$t" ] &&
+         [ "$t" -lt "$x" ] && echo ordered) (bridge=$b termux=$t x11=$x)"
 
 # ==========================================================================
 echo
