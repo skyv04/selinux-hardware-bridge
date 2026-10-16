@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Any smart-card reader (USB class 11, CCID). A YubiKey declares the class
+     on one of its interfaces rather than on the whole device; Android checks
+     both. Matched by UsbAttachActivity. -->
+<resources>
+    <usb-device class="11" />
+</resources>

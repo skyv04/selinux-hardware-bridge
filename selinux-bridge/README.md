@@ -43,16 +43,18 @@ to remind you.
 
 | File | Purpose |
 |---|---|
-| `AndroidManifest.xml` | One activity, one foreground service, one boot receiver. `INTERNET` only for the loopback socket; `RECEIVE_BOOT_COMPLETED` and `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` for the gap-#4 mitigations. |
+| `AndroidManifest.xml` | One activity, one foreground service, one boot receiver. `INTERNET` only for the loopback socket; `RECEIVE_BOOT_COMPLETED` and `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` for the gap-#4 mitigations. Also an invisible USB-attach activity and the USB-link receiver (gap #40). |
 | `app/src/main/java/com/selinuxbridge/app/MainActivity.java` | Launcher UI; starts the bridge service in the foreground so Android doesn't kill it, and shows the current Doze state with a one-tap battery-optimisation exemption. Everything is drawn programmatically (gradients, a small chip-logo icon, a pulsing "alive" status dot, a data-flow diagram) rather than a blank white screen — see screenshot note below. |
 | `app/src/main/java/com/selinuxbridge/app/BridgeService.java` | The actual bridge: `ServerSocket` on `127.0.0.1:7878`, wire protocol below, drives `android.media.MediaCodec` synchronously, explicitly preferring hardware (`c2.qti.*`) codec components, admits sessions through a semaphore sized from the device's own codec-instance limit, one thread per client so a crashed session doesn't take down the accept loop, and logs to a file it can also stream back over the socket. |
 | `app/src/main/java/com/selinuxbridge/app/BootReceiver.java` | Restarts the service after a reboot (`BOOT_COMPLETED`/`QUICKBOOT_POWERON`) and after an in-place update (`MY_PACKAGE_REPLACED`), so the two recoverable halves of gap #4 need no human. |
 | `app/src/main/java/com/selinuxbridge/app/I420.java` | Conversion between the tightly packed I420 the wire protocol carries and whatever layout MediaCodec actually hands out (padded row strides, padded slice heights, semi-planar chroma). Deliberately framework-free so it can be unit tested on a normal JVM. |
 | `app/src/main/java/com/selinuxbridge/app/CameraSource.java` | Camera2 capture for `mode=4`, repacked to tightly packed I420 through `I420.java`. Enumerates back camera first, picks the nearest supported size to the request (and announces what it got), and holds a bounded queue that **drops the oldest** frame under pressure — for a live camera, latency matters and a dropped frame does not. |
 | `app/src/main/java/com/selinuxbridge/app/MicSource.java` | `AudioRecord` capture for `mode=5`, emitting little-endian S16 in ~100 ms units, with a buffer 4× the reported minimum so a scheduling hiccup doesn't overrun it. |
+| `app/src/main/java/com/selinuxbridge/app/UsbAttachActivity.java` + `app/src/main/res/xml/usb_smart_card.xml` | Declares every USB smart-card reader (class 11), so the app can be made a reader's default and Android grants it the reader by itself on every plug-in. Shows nothing and finishes at once. |
+| `app/src/main/java/com/selinuxbridge/app/UsbLinkReceiver.java` | Opens a USB device on Termux's behalf and hands it the descriptor over Binder, serving Termux's uid only. android-piv-bridge's `UsbOpen` is the other end. |
 | `bridge_client.c` | Debian-side client/CLI: connects over loopback, sends raw frames or a bitstream (from a file or a pipe), prints round-trip stats and the codec name actually used. Supports `encode`/`decode`/`info`/`log`/`camera`/`mic`, h264/hevc/vp9/av1 via `-c`, bounded socket timeouts with a distinct exit code, a streaming Annex-B splitter with O(1) memory, and v4 format records so `decode` needs no dimensions. |
-| `build.sh` | Rebuilds the signed APK from source using raw SDK command-line tools (`aapt2`, `javac`, `d8`, `apksigner`) — no gradle/network dependency. Signs with a persistent key in `keystore/` so rebuilds install as in-place updates. |
-| `keystore/` | Local debug signing key, gitignored. Kept outside `build/` so `build.sh`'s clean step cannot destroy it (see gap #9). |
+| `build.sh` | Rebuilds the signed APK from source using raw SDK command-line tools (`aapt2`, `javac`, `d8`, `apksigner`) — no gradle/network dependency. Signs with a persistent key at `~/.android/selinux-bridge.keystore`, outside the checkout, so rebuilds install as in-place updates (gap #39). |
+| `keystore/` | Where the key used to live, gitignored. `build.sh` moves a key found here to `~/.android/`, since one inside the checkout is lost with it (gap #39). |
 | `../ffmpeg/selinuxbridge.c` | libavcodec wrapper registering `h264_selinuxbridge` / `hevc_selinuxbridge` as real ffmpeg **encoders and decoders**. |
 | `../ffmpeg/selinuxbridge-ffmpeg.patch` | The three-file registration patch (`allcodecs.c`, `Makefile`, `configure`) that ffmpeg's build needs. |
 | `tools/bridge-status` | Health-check script: reports whether the app is reachable and prints its `info` diagnostics (device, Android version, all four video codecs and which are hardware-backed, concurrency limit). `--log` also dumps the app's log. |
@@ -85,8 +87,11 @@ Requires an Android SDK with build-tools and a `platforms/android-34`
 ./build.sh
 ```
 
-Produces `build/apk_final/selinux-bridge.apk` (signed with a throwaway debug
-key generated on first run) and `./bridge_client`.
+Produces `build/apk_final/selinux-bridge.apk` and `./bridge_client`. The APK
+is signed with a local debug key, `~/.android/selinux-bridge.keystore`,
+generated on the first run and reused after that. Keep it, and back it up:
+Android installs a build over the installed app only when both are signed
+with the same key (gap #39).
 
 **Non-obvious build detail**: this SDK ships build-tools in two flavors —
 an ARM64-native one (`34.0.0`, only has `aapt2`/`aidl`/`zipalign`/`dexdump`)
@@ -121,6 +126,12 @@ update — Android has no way to know it's "the same app" under a new
 package ID. If you previously installed the old `com.gpucodec.bridge`
 build, uninstall it manually (it will keep running/showing up separately
 otherwise) after confirming the new one works.
+
+**Signing-key note**: builds before gap #39 was fixed are signed with a
+key that no longer exists. Android will not install a newer build over one
+of them ("App not installed"), so uninstall SELinux Hardware Bridge once,
+then install the new APK. Opening it afterwards asks again for the camera,
+the microphone and the battery exemption. Later builds update in place.
 
 Launch the app once and leave it open (or in the recent-apps list — it runs
 as a foreground service with a persistent notification, so Android won't
@@ -214,6 +225,39 @@ network-fetched design tooling.
   Linux Security Modules framework (itself not a vendor trademark; NSA
   open-sourced it in 2000), used the same way this repo's own docs already
   refer to it throughout.
+
+## USB smart-card readers: asked once per key
+
+[android-piv-bridge](https://github.com/skyv04/android-piv-bridge) needs an
+open descriptor for the YubiKey. Through `termux-usb`, Android asks for it
+again after every unplug, on the phone's own screen even when the desktop
+is on a monitor. Termux:API's manifest declares no USB device, so it can
+never be made a device's default (gap #40).
+
+This app declares every smart-card reader (USB class 11) for
+`UsbAttachActivity`. The first time a key meets the app, Android's question
+carries an **"Always open SELinux Hardware Bridge"** box. Ticked, it makes
+the app that key's default. From then on, Android grants the app the key by
+itself whenever it is plugged in, and starts the activity, which shows
+nothing and finishes at once.
+
+The question comes either when the key is plugged in or when
+`piv-bridge permit`/`start` asks on the app's behalf.
+
+`UsbLinkReceiver` hands the key to Termux:
+
+1. android-piv-bridge's `UsbOpen`, run as Termux through `app_process`,
+   sends an explicit `com.selinuxbridge.app.action.USB_LINK` broadcast
+   carrying a Binder.
+2. The receiver answers with a Binder of its own (`com.selinuxbridge.app.UsbLink`,
+   version 1). That Binder refuses every caller whose uid is not Termux's.
+3. `LIST` reports, for each attached device, whether the app holds its
+   permission. `usb-list.dex`'s sixth column comes from it.
+4. `OPEN` opens a device and returns the descriptor. If the permission is
+   missing and the caller allows it, `OPEN` first asks for it and waits.
+
+The app keeps nothing open. The descriptor belongs to the process it was
+handed to, and the app's own copy is closed as soon as it is sent.
 
 ## Wire protocol (v6)
 
@@ -1152,6 +1196,8 @@ live microphone at the same time, with no switches at all.
 | 36 | **The camera was "disabled by policy" after the service restarted in the background.** `openCamera` failed with `CAMERA_DISABLED (1): ... Camera "0" disabled by policy` for hours. This was not a device-management policy. Since Android 11, a foreground service started while the app is in the background (by `BootReceiver`, or by `START_STICKY` after the process was killed) does not get "while-in-use" access to the camera or microphone. CameraService answers that app-op refusal as "disabled by policy", and the microphone is handed silence instead of an error. The client only saw a stream that ended before its first frame. | High | ⚠️ mitigated | Bringing the app to the foreground once restores access, and it then survives backgrounding: `MainActivity.onCreate` calls `startForegroundService()`, which from the foreground hands the access back. Android offers no way to restore it from the background. Two corrections came later (gap #38). A launch re-runs `onCreate` only when it creates the activity afresh, so it now uses `-f 0x10008000` (`NEW_TASK\|CLEAR_TASK`). And Android does not always honour a launch from Termux, while `am` reports success either way, so `termux/start-debian` opens the app on every start, while Termux is still on screen. The Windows 365 launcher in android-piv-bridge probes the camera and microphone before every start and makes that round trip automatically when either is refused. When the camera is still withheld afterwards, it asks for one tap on the app's notification and waits for it. The reason is in `bridge_client log`, which the client already names when a capture produces nothing. |
 | 37 | **The launcher check from #33 cried wolf.** On a healthy system `hw-enable doctor` reported **5 of 10 launchers as risky**. All five were false alarms: two scripts only *mention* a Termux path in a comment, one is an ELF binary that `grep` matched byte-for-byte, and two Python launchers strip the loader variables with `if k not in ("LD_PRELOAD","LD_LIBRARY_PATH")` rather than `env -u`. A check that fails on correct code teaches people to ignore it, which is worse than having no check. | Medium | ✅ fixed | The sweep is now its own function, also reachable as `hw-enable scan-launchers [dir...]`. It skips binaries (`grep -I`), ignores comment lines, accepts the `unset` and Python filtering forms as valid guards, and counts calls through `termux-run` as safe crossings. A new `launchers` test suite runs it against ten fixtures: three broken launchers that have to be flagged and seven safe ones that must not be. |
 | 38 | **The launcher stopped short of opening the companion app, so a session could start without camera or microphone, and the repair from #36 stopped working.** `termux/start-debian` opened the app only when nothing listened on its port. After Android restarts the service in the background (gap #36), the port still answers, so the launcher said `already running` and moved on, and the session began with the camera "disabled by policy" and a silent microphone. When it did open the app, it did so only after Termux:X11 had taken the screen. The repair from #36 then failed the same way: five `am start` variants issued from Termux while Termux:X11 covered it all exited 0, and none restored access, although the same call had restored it a week earlier. Opening the app by hand did. Two things defeat such a launch, and `am` reports success in both cases: when the activity still exists, a plain launch only resumes it, so `onCreate` does not run; and Android may ignore an activity start from an app that is not on screen. `logcat` and `dumpsys` cannot be read from Termux, so which of the two it was could not be established. | High | ✅ fixed | Step 6 of `termux/start-debian` opens the app on **every** run, listening or not, with `-f 0x10008000` (`NEW_TASK\|CLEAR_TASK`), so that `onCreate` runs and starts the service from the foreground. It does this before the X server, while Termux is still the window the command was typed into, and then brings Termux back, so that step 8's launch of Termux:X11 also comes from an app on screen. The step names the fallback: if the window did not appear, one tap on the app's notification does the same, because its content intent (`NEW_TASK\|CLEAR_TOP`) always recreates the activity. In android-piv-bridge, `w365-media-check --fix` launches with the same flags. When the camera is still withheld after that, it shows "Tap the SELinux Hardware Bridge notification on the phone" and waits up to 60 s for the camera to work before Windows 365 opens, then restarts the microphone pipeline only if it is still silent. |
+| 39 | **The signing key was lost with the checkout, undoing #9.** The key had moved to `selinux-bridge/keystore/`, gitignored, out of reach of `rm -rf build`, but not of the checkout itself. When the repository had to be cloned afresh, the key went with the old clone. The installed app is signed `7a229262…5d07a1`, and no key on the device matches it, so no newer build can be installed over it. | Medium | ✅ fixed | `build.sh` keeps the key at `~/.android/selinux-bridge.keystore`, beside Android's own debug key, and moves a key it finds at either old location there. The installed copy needs one uninstall and reinstall. The Installing section says so, and that the camera, microphone and battery grants are then asked for again. |
+| 40 | **Android asked for the YubiKey after every unplug.** android-piv-bridge reaches the key through `termux-usb`, and Android keeps Termux's USB permission only until the device is detached. There is no "always" for Termux: that box is offered only to an app whose manifest declares the device, and Termux:API's does not. Each re-plug therefore meant another question, on the phone's own screen, while the desktop was on the monitor. | Medium | ✅ fixed (pending install) | The app declares every smart-card reader (`UsbAttachActivity`, `res/xml/usb_smart_card.xml`, class 11), so the first question for a key offers "Always open SELinux Hardware Bridge". Ticked, it makes Android grant the key to the app on every plug-in. `UsbLinkReceiver` opens the key for Termux and hands it the descriptor over a Binder that serves Termux's uid only. android-piv-bridge's `UsbOpen` uses that Binder, and falls back to `termux-usb` when the app is missing. |
 
 
 ## Verification of the fixes
@@ -1343,6 +1389,10 @@ rather than waited for; all of it is now checked in as `tools/selftest` and
 | #38 suite | `termux/test-start-debian`: the app is opened even when its port already answers, with `-f 0x10008000`, and the notification is named as the fallback; the app's launch comes before Termux is brought back, which comes before Termux:X11 | **82 passed, 0 failed**, against both the published script and the copy in use on this device |
 | #38 desktop repair | android-piv-bridge `tests/test_w365_media_check.py`: the flags; the tap asked for once, the wait ending as soon as the camera works and the desktop brought back; a microphone that came back with the access left running, one still silent restarted; no tap gives a failure that names the notification; `W365_BRIDGE_WAIT=0` does not wait | **62 checks passed**; `make check` passes in full |
 | #38 live | `termux/start-debian` on the device | pending: it replaces the desktop it would be run from, so the first real run is the next start |
+| #39 key | `apksigner verify --print-certs` on the installed APK, against `~/.android/debug.keystore`; then two consecutive `./build.sh` runs | installed `7a229262…5d07a1`; `debug.keystore` is `7bc1…`, and no other key is left on the device. Both new builds sign with `316189a2…9b852c` |
+| #40 manifest | `aapt2 dump xmltree` of the built APK | `UsbAttachActivity` exported, `Theme.NoDisplay`, `USB_DEVICE_ATTACHED` with `@xml/usb_smart_card`; `UsbLinkReceiver` exported with `USB_LINK`; `<queries>` names `com.termux` |
+| #40 client | android-piv-bridge `tests/test_piv_bridge.py`: the app preferred when allowed, Termux's permission used while it lasts, the app asked when neither holds it, `termux-usb` without the app; `UsbOpen` run live against the old app | **113 checks passed**; `UsbOpen` exits **69** with "not installed, or is a build without the USB link", and `usb-list` prints `-` in the app's column |
+| #40 live | the new APK installed; the YubiKey plugged in, "Always" ticked, then unplugged and plugged in again | pending the install tap |
 
 The server-side halves of #1, #10 and #11 live in the APK, and sideloading
 on this device needs a physical install tap that cannot be scripted (`pm
@@ -1355,7 +1405,8 @@ applies to the server half of protocol v4: the format records are emitted
 from `Image.getCropRect()` in `runPump()`, and every client-side consequence
 of them is covered above against `tools/mock-bridge.py`, but the crop values
 themselves come from a real `MediaCodec` and are verified by inspection. The signing
-key is now stable (gap #9), so it installs as an in-place update.
+key is stable again (gaps #9 and #39), so after the one reinstall #39
+requires, builds install as in-place updates.
 
 ## What this does *not* solve
 

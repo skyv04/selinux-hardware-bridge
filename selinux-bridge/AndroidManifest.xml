@@ -39,6 +39,15 @@
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
+    <!-- USB smart-card readers (the YubiKey) are opened on Termux's behalf;
+         see UsbLinkReceiver. Not required: the rest works without USB host. -->
+    <uses-feature android:name="android.hardware.usb.host" android:required="false" />
+    <!-- UsbLinkReceiver serves Termux's uid and nobody else's, and can only
+         tell which uid is Termux's if Termux is visible to this app. -->
+    <queries>
+        <package android:name="com.termux" />
+    </queries>
+
     <application
         android:label="@string/app_name"
         android:icon="@mipmap/ic_launcher"
@@ -71,6 +80,31 @@
             </intent-filter>
             <intent-filter>
                 <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- The lasting USB grant: once "Always" is ticked for a reader,
+             Android grants it to this app on every plug-in and starts this
+             (invisible) activity. -->
+        <activity android:name=".UsbAttachActivity"
+            android:exported="true"
+            android:theme="@android:style/Theme.NoDisplay"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:label="@string/app_name">
+            <intent-filter>
+                <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
+            </intent-filter>
+            <meta-data android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
+                android:resource="@xml/usb_smart_card" />
+        </activity>
+
+        <!-- Exported so Termux can reach it; every call it serves is checked
+             against the caller's uid. -->
+        <receiver android:name=".UsbLinkReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.selinuxbridge.app.action.USB_LINK" />
             </intent-filter>
         </receiver>
 

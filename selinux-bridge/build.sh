@@ -23,19 +23,26 @@ PLATFORM_JAR="${PLATFORM_JAR:-$SDK/platforms/android-34/android.jar}"
 # build/debug.keystore, which `rm -rf build` below destroyed on every run,
 # so each rebuild produced an APK with a different signing identity and
 # Android refused to install it over the previous one ("App not installed"),
-# forcing an uninstall and losing app state. Keeping it in keystore/ makes
-# rebuilds true in-place updates. The directory is gitignored: this is a
-# local debug key, never a release key, and must not be committed.
-KEYSTORE="${KEYSTORE:-keystore/selinux-bridge.keystore}"
+# forcing an uninstall and losing app state.
+#
+# It lives outside the checkout too. It was next at keystore/ in here,
+# gitignored, and was lost with the checkout when the repository had to be
+# cloned afresh -- and with it every chance of updating the installed app in
+# place. ~/.android is where Android's tools keep their own debug key, and it
+# outlives any one clone. This is a local debug key, never a release key, and
+# must not be committed; back it up with the rest of the home directory.
+KEYSTORE="${KEYSTORE:-$HOME/.android/selinux-bridge.keystore}"
 
-# Migrate a key from the old throwaway location BEFORE build/ is wiped, so
-# an already-installed APK keeps updating in place instead of needing an
+# Migrate a key from either old location BEFORE build/ is wiped, so an
+# already-installed APK keeps updating in place instead of needing an
 # uninstall (Android rejects an update signed by a different key).
 mkdir -p "$(dirname "$KEYSTORE")"
-if [ ! -f "$KEYSTORE" ] && [ -f build/debug.keystore ]; then
-  echo "migrating signing key out of build/ so rebuilds stop changing identity"
-  cp build/debug.keystore "$KEYSTORE"
-fi
+for old in keystore/selinux-bridge.keystore build/debug.keystore; do
+  if [ ! -f "$KEYSTORE" ] && [ -f "$old" ]; then
+    echo "moving the signing key from $old to $KEYSTORE, out of reach of a re-clone"
+    cp "$old" "$KEYSTORE"
+  fi
+done
 
 rm -rf build
 mkdir -p build/res-compiled build/gen build/classes build/dex build/apk_unsigned build/apk_final
